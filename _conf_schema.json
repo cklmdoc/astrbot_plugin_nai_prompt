@@ -1,0 +1,38 @@
+{
+  "allowed_user_ids": {
+    "type": "list",
+    "description": "允许使用 /提示词 的用户 ID 白名单；留空时仅 AstrBot 管理员可用。",
+    "items": {"type": "string"},
+    "default": []
+  },
+  "cooldown_seconds": {
+    "type": "int",
+    "description": "同一用户两次生成之间的冷却秒数；设为 0 关闭。",
+    "default": 5
+  },
+  "seaart_enabled": {
+    "type": "bool",
+    "description": "Danbooru 未命中角色标签时，尝试 SeaArt 公开页面检索。",
+    "default": true
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "Danbooru / SeaArt 外部请求超时秒数（2-15）。",
+    "default": 5
+  },
+  "proxy_url": {
+    "type": "string",
+    "description": "仅用于 Danbooru 与 SeaArt 标签检索的可选 HTTP(S) 代理，例如 http://127.0.0.1:7890。",
+    "default": ""
+  },
+  "allow_adult_prompts": {
+    "type": "bool",
+    "description": "允许用户明确请求成人向提示词；疑似未成年人内容始终降级全年龄。",
+    "default": true
+  },
+  "max_prompt_length": {
+    "type": "int",
+    "description": "最终正面 Prompt 最大字符数。",
+    "default": 1800
+  }
+}
