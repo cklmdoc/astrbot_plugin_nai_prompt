@@ -10,19 +10,20 @@
     "description": "同一用户两次生成之间的冷却秒数；设为 0 关闭。",
     "default": 5
   },
+  "danbooru_search_api_url": {
+    "type": "string",
+    "description": "DanbooruSearch API 基址，可填兼容的自建实例或镜像。",
+    "hint": "默认 https://sakizuki-danboorusearch.hf.space/api；末尾 / 会自动忽略。",
+    "default": "https://sakizuki-danboorusearch.hf.space/api"
+  },
   "request_timeout_seconds": {
     "type": "int",
-    "description": "每个 SeaArt / Danbooru HTTP 请求的超时秒数（2-15）。",
-    "default": 15
-  },
-  "proxy_url": {
-    "type": "string",
-    "description": "仅用于 SeaArt 与 Danbooru 标签检索的可选 HTTP(S) 代理，例如 http://127.0.0.1:7890。",
-    "default": ""
+    "description": "每个 DanbooruSearch HTTP 请求的超时秒数（2-15）。",
+    "default": 5
   },
   "allow_adult_prompts": {
     "type": "bool",
-    "description": "允许用户明确请求成人向提示词；疑似未成年人内容始终降级全年龄。",
+    "description": "允许明确成人角色的成人向提示词。",
     "default": true
   },
   "max_prompt_length": {

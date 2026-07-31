@@ -15,6 +15,8 @@ AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI �
 /提示词 流萤和橘望在花园里拥抱
 ```
 
-流程：当前会话 LLM 解析严格 JSON → SeaArt 优先检索公开训练/提示词标签 → Danbooru 补充或回退角色标签 → 本地规则兜底。
+流程：当前会话 LLM 按 JSON 规则转译 → DanbooruSearch 语义搜索角色 → 关联 General 特征增强 → 最终 Prompt 组装。
 
-成人向仅在用户明确请求且 `allow_adult_prompts=true` 时生成；疑似未成年人描述始终降级为全年龄。
+DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若不可用或角色匹配分数不足，插件仍输出 LLM 转译结果。
+
+成人向仅在 LLM 标记角色为 `adult` 且 `allow_adult_prompts=true` 时启用；其它情况均生成全年龄版本。

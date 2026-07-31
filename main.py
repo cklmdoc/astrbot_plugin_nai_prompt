@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -13,11 +11,13 @@ from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 
 from .prompt_engine import (
+    DANBOORU_SEARCH_API_DEFAULT,
+    DanbooruSearchLookup,
     ParsedRequest,
-    TagLookup,
     build_prompt,
     format_result,
     parse_llm_response,
+    resolve_nsfw_level,
 )
 
 HELP_TEXT = """用法：/提示词 <自然语言描述>
@@ -27,14 +27,14 @@ HELP_TEXT = """用法：/提示词 <自然语言描述>
 MAX_DESCRIPTION_LENGTH = 500
 
 LLM_SYSTEM_PROMPT = """你是 NAI 标签提示词解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
-将用户的自然语言转换为紧凑、逗号分隔所需的英文 NAI/Danbooru 标签数据。
+将用户自然语言转换为紧凑、英文小写 NAI/Danbooru 标签数据。
 
 JSON schema:
 {
  "characters": [
    {
-     "display_name": "角色中文或常用名",
-     "danbooru_tag": "canonical_character_tag_",
+     "display_name": "角色中文或常用名；原创角色填空字符串",
+     "danbooru_tag": "留空字符串；角色标签由插件查询服务确定",
      "tags": ["该角色本次明确指定的专属外观标签"]
    }
  ],
@@ -42,17 +42,19 @@ JSON schema:
  "outfit_tags": ["用户明确指定的服装"],
  "action_tags": ["动作和互动"],
  "scene_tags": ["场景、道具、明确光照或时间"],
- "style_tags": ["最多少量风格标签，可用 1.2::key_tag:: 强调关键元素"],
+ "style_tags": ["少量风格标签，可用 1.2::key_tag:: 强调关键元素"],
  "nsfw_level": "safe|suggestive|explicit"
 }
 
 规则：
-- 角色仅在确定时才填写 danbooru_tag；不确定则留空，绝不编造。
+- 角色仅在明确提及既有角色时填写 display_name；原创 OC 的 characters 可为空数组。
+- danbooru_tag 必须留空字符串，插件会使用 DanbooruSearch 查询 canonical 角色标签。
 - 普通标签必须英文小写下划线；不要写完整句子。
 - 不得添加用户未明确描述的服装、道具、天气、光照、时间或外观。
 - 不得输出 masterpiece、best_quality、画师标签、负面词、尺寸或比例词；插件会统一处理。
 - 不要堆叠同义词；每个概念只保留一个最准确标签。
 - 未提及的数组必须返回空数组。"""
+
 FORMAT_RETRY_PROMPT = """上一次输出不符合指定 JSON schema。
 请只返回完整、合法的 JSON 对象，不要 Markdown、解释或其它文字。
 必须包含 characters、shared_tags、outfit_tags、action_tags、scene_tags、style_tags、nsfw_level；
@@ -63,13 +65,13 @@ class NaiPromptPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
         self.config = config or {}
-        self.lookup: TagLookup | None = None
+        self.lookup: DanbooruSearchLookup | None = None
         self._last_request: dict[str, float] = {}
 
     async def initialize(self) -> None:
-        self.lookup = TagLookup(
+        self.lookup = DanbooruSearchLookup(
+            api_url=self._cfg_str("danbooru_search_api_url", DANBOORU_SEARCH_API_DEFAULT),
             timeout_seconds=self._cfg_int("request_timeout_seconds", 5, 2, 15),
-            proxy_url=self._cfg_str("proxy_url"),
         )
         logger.info("[NAIPrompt] 插件已加载")
 
@@ -102,7 +104,6 @@ class NaiPromptPlugin(Star):
 
     @staticmethod
     def _is_admin(event: AstrMessageEvent) -> bool:
-        # AstrBot adapters expose this differently across versions; fail closed.
         for attr in ("is_admin", "is_admin_user"):
             value = getattr(event, attr, False)
             if callable(value):
@@ -140,23 +141,15 @@ class NaiPromptPlugin(Star):
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
             if not provider:
                 return None
-            response = await provider.text_chat(
-                prompt=description,
-                contexts=[],
-                system_prompt=LLM_SYSTEM_PROMPT,
-            )
-            text = getattr(response, "completion_text", "") if response else ""
-            parsed = parse_llm_response(text)
+            response = await provider.text_chat(prompt=description, contexts=[], system_prompt=LLM_SYSTEM_PROMPT)
+            parsed = parse_llm_response(getattr(response, "completion_text", "") if response else "")
             if parsed is not None:
                 return parsed
             logger.warning("[NAIPrompt] LLM 首次输出不符合 JSON schema，执行一次格式重试")
-            retry_response = await provider.text_chat(
-                prompt=f"{description}\n\n{FORMAT_RETRY_PROMPT}",
-                contexts=[],
-                system_prompt=LLM_SYSTEM_PROMPT,
+            retry = await provider.text_chat(
+                prompt=f"{description}\n\n{FORMAT_RETRY_PROMPT}", contexts=[], system_prompt=LLM_SYSTEM_PROMPT,
             )
-            retry_text = getattr(retry_response, "completion_text", "") if retry_response else ""
-            return parse_llm_response(retry_text)
+            return parse_llm_response(getattr(retry, "completion_text", "") if retry else "")
         except Exception as exc:
             logger.warning("[NAIPrompt] LLM 解析失败: %s", exc)
             return None
@@ -164,8 +157,9 @@ class NaiPromptPlugin(Star):
     async def _lookup_characters(self, parsed: ParsedRequest):
         if self.lookup is None:
             return []
-        requests = parsed.characters[:20]
-        results = await asyncio.gather(*(self.lookup.lookup(request) for request in requests))
+        final_level = resolve_nsfw_level(parsed, self._cfg_bool("allow_adult_prompts", True))
+        show_nsfw = final_level == "explicit"
+        results = await asyncio.gather(*(self.lookup.lookup(item, show_nsfw) for item in parsed.characters[:20]))
         return [result for result in results if result is not None]
 
     @filter.command("提示词")
@@ -181,8 +175,7 @@ class NaiPromptPlugin(Star):
         if not self._allowed(event):
             yield event.plain_result("当前用户未获提示词功能授权，请联系管理员。")
             return
-        sender_id = self._sender_id(event)
-        throttled = self._cooldown_message(sender_id)
+        throttled = self._cooldown_message(self._sender_id(event))
         if throttled:
             yield event.plain_result(throttled)
             return
@@ -194,10 +187,8 @@ class NaiPromptPlugin(Star):
         characters = await self._lookup_characters(parsed)
         result = build_prompt(
             parsed=parsed,
-            description=description,
             lookup_results=characters,
             allow_adult=self._cfg_bool("allow_adult_prompts", True),
             max_length=self._cfg_int("max_prompt_length", 1800, 200, 5000),
-            used_fallback=False,
         )
         yield event.plain_result(format_result(result))
