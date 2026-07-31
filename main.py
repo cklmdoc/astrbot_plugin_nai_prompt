@@ -24,8 +24,7 @@ from .prompt_engine import (
 HELP_TEXT = """用法：/提示词 <自然语言描述>
 
 示例：
-/提示词 绿色双马尾猫耳少女，穿校服，在樱花树下微笑
-/提示词 流萤和橘望在花园里拥抱"""
+/提示词 流萤穿校服，在樱花树下微笑"""
 MAX_DESCRIPTION_LENGTH = 500
 
 LLM_SYSTEM_PROMPT = """你是 NAI/Danbooru 标签解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
