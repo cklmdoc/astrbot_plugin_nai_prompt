@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from astrbot.api import logger
@@ -12,9 +13,11 @@ from astrbot.core import AstrBotConfig
 
 from .prompt_engine import (
     DANBOORU_SEARCH_API_DEFAULT,
+    CharacterTags,
     DanbooruSearchLookup,
     ParsedRequest,
     build_prompt,
+    extract_json,
     format_result,
     parse_llm_response,
     resolve_nsfw_level,
@@ -59,6 +62,21 @@ FORMAT_RETRY_PROMPT = """上一次输出不符合指定 JSON schema。
 请只返回完整、合法的 JSON 对象，不要 Markdown、解释或其它文字。
 必须包含 characters、shared_tags、outfit_tags、action_tags、scene_tags、style_tags、nsfw_level；
 characters 的每一项必须包含 display_name、danbooru_tag、tags。"""
+
+CONFLICT_FILTER_SYSTEM_PROMPT = """你是标签去冲突器。用户明确指定了服装和/或动作标签，你需要从角色的关联标签中移除与用户指定标签语义冲突的标签。
+
+只返回一个合法 JSON 对象，不要 Markdown、解释或额外文字。
+
+JSON schema:
+{
+  "filtered_tags": ["过滤后的标签列表"]
+}
+
+规则：
+- 保留角色 canonical 标签（通常为第一个标签）
+- 移除与用户指定服装标签语义冲突的标签（如用户指定 swimsuit，则移除 school_uniform、dress 等服装标签）
+- 移除与用户指定动作标签语义冲突的标签（如用户指定 running，则移除 standing、sitting 等动作/姿态标签）
+- 保留不冲突的特征标签（如发色、瞳色、体型等）"""
 
 
 class NaiPromptPlugin(Star):
@@ -162,6 +180,50 @@ class NaiPromptPlugin(Star):
         results = await asyncio.gather(*(self.lookup.lookup(item, show_nsfw) for item in parsed.characters[:20]))
         return [result for result in results if result is not None]
 
+    async def _filter_conflicting_tags(self, event: AstrMessageEvent, parsed: ParsedRequest, lookup_results: list[CharacterTags]) -> list[CharacterTags]:
+        """通过 LLM 过滤角色关联标签中与用户指定服装/动作冲突的默认标签。
+
+        仅当用户明确指定了 outfit_tags 或 action_tags 时触发。
+        按角色分别调用 LLM，并行执行；失败时降级为仅保留 canonical tag。
+
+        Args:
+            event: 消息事件
+            parsed: LLM 解析结果，包含 outfit_tags 和 action_tags
+            lookup_results: DanbooruSearch 查询结果列表
+
+        Returns:
+            过滤后的 CharacterTags 列表
+        """
+        if not parsed.outfit_tags and not parsed.action_tags:
+            return lookup_results
+
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            logger.warning("[NAIPrompt] 无可用 LLM provider，标签冲突过滤降级")
+            return [CharacterTags(r.display_name, r.canonical_tag, [r.canonical_tag]) for r in lookup_results]
+
+        async def filter_one(result: CharacterTags) -> CharacterTags:
+            prompt = json.dumps({
+                "outfit_tags": parsed.outfit_tags,
+                "action_tags": parsed.action_tags,
+                "character_tags": result.tags,
+            }, ensure_ascii=False)
+            try:
+                response = await provider.text_chat(prompt=prompt, contexts=[], system_prompt=CONFLICT_FILTER_SYSTEM_PROMPT)
+                text = getattr(response, "completion_text", "") if response else ""
+                data = extract_json(text)
+                if data and isinstance(data.get("filtered_tags"), list):
+                    filtered = [str(t) for t in data["filtered_tags"] if isinstance(t, str)]
+                    if filtered:
+                        logger.info("[NAIPrompt] 角色 %s 标签冲突过滤完成: %d -> %d", result.display_name, len(result.tags), len(filtered))
+                        return CharacterTags(result.display_name, result.canonical_tag, filtered)
+            except Exception as exc:
+                logger.warning("[NAIPrompt] 角色 %s 标签冲突过滤异常: %s", result.display_name, exc)
+            # 降级：只保留 canonical tag
+            return CharacterTags(result.display_name, result.canonical_tag, [result.canonical_tag])
+
+        return list(await asyncio.gather(*(filter_one(r) for r in lookup_results)))
+
     @filter.command("提示词")
     async def prompt_command(self, event: AstrMessageEvent, description: str = ""):
         """/提示词 <自然语言描述>：生成可复制的 NAI 正负面提示词。"""
@@ -185,6 +247,7 @@ class NaiPromptPlugin(Star):
             yield event.plain_result("提示词解析失败，请稍后重试。")
             return
         characters = await self._lookup_characters(parsed)
+        characters = await self._filter_conflicting_tags(event, parsed, characters)
         result = build_prompt(
             parsed=parsed,
             lookup_results=characters,
