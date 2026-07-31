@@ -16,7 +16,6 @@ from .prompt_engine import (
     ParsedRequest,
     TagLookup,
     build_prompt,
-    fallback_parse,
     format_result,
     parse_llm_response,
 )
@@ -27,20 +26,37 @@ HELP_TEXT = """用法：/提示词 <自然语言描述>
 /提示词 流萤穿校服，在樱花树下微笑"""
 MAX_DESCRIPTION_LENGTH = 500
 
-LLM_SYSTEM_PROMPT = """你是 NAI/Danbooru 标签解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
-将中文描述转换为小写 Danbooru 风格英文标签。不要编造角色标签；只有你确知的角色才放入 character_candidates，格式如 firefly_。
+LLM_SYSTEM_PROMPT = """你是 NAI 标签提示词解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
+将用户的自然语言转换为紧凑、逗号分隔所需的英文 NAI/Danbooru 标签数据。
+
 JSON schema:
 {
- "character_candidates": ["character_tag_"],
- "character_groups": [["character_specific_tag"]],
- "subject_tags": ["1girl"],
- "outfit_tags": ["school_uniform"],
- "action_tags": ["smile"],
- "scene_tags": ["cherry_blossoms"],
- "style_tags": ["anime_coloring"],
+ "characters": [
+   {
+     "display_name": "角色中文或常用名",
+     "danbooru_tag": "canonical_character_tag_",
+     "tags": ["该角色本次明确指定的专属外观标签"]
+   }
+ ],
+ "shared_tags": ["人数和共享主体标签，如 1girl"],
+ "outfit_tags": ["用户明确指定的服装"],
+ "action_tags": ["动作和互动"],
+ "scene_tags": ["场景、道具、明确光照或时间"],
+ "style_tags": ["最多少量风格标签，可用 1.2::key_tag:: 强调关键元素"],
  "nsfw_level": "safe|suggestive|explicit"
 }
-所有 tag 必须是英文小写下划线形式。未提及的字段返回空数组。"""
+
+规则：
+- 角色仅在确定时才填写 danbooru_tag；不确定则留空，绝不编造。
+- 普通标签必须英文小写下划线；不要写完整句子。
+- 不得添加用户未明确描述的服装、道具、天气、光照、时间或外观。
+- 不得输出 masterpiece、best_quality、画师标签、负面词、尺寸或比例词；插件会统一处理。
+- 不要堆叠同义词；每个概念只保留一个最准确标签。
+- 未提及的数组必须返回空数组。"""
+FORMAT_RETRY_PROMPT = """上一次输出不符合指定 JSON schema。
+请只返回完整、合法的 JSON 对象，不要 Markdown、解释或其它文字。
+必须包含 characters、shared_tags、outfit_tags、action_tags、scene_tags、style_tags、nsfw_level；
+characters 的每一项必须包含 display_name、danbooru_tag、tags。"""
 
 
 class NaiPromptPlugin(Star):
@@ -54,7 +70,6 @@ class NaiPromptPlugin(Star):
         self.lookup = TagLookup(
             timeout_seconds=self._cfg_int("request_timeout_seconds", 5, 2, 15),
             proxy_url=self._cfg_str("proxy_url"),
-            seaart_enabled=self._cfg_bool("seaart_enabled", True),
         )
         logger.info("[NAIPrompt] 插件已加载")
 
@@ -131,7 +146,17 @@ class NaiPromptPlugin(Star):
                 system_prompt=LLM_SYSTEM_PROMPT,
             )
             text = getattr(response, "completion_text", "") if response else ""
-            return parse_llm_response(text)
+            parsed = parse_llm_response(text)
+            if parsed is not None:
+                return parsed
+            logger.warning("[NAIPrompt] LLM 首次输出不符合 JSON schema，执行一次格式重试")
+            retry_response = await provider.text_chat(
+                prompt=f"{description}\n\n{FORMAT_RETRY_PROMPT}",
+                contexts=[],
+                system_prompt=LLM_SYSTEM_PROMPT,
+            )
+            retry_text = getattr(retry_response, "completion_text", "") if retry_response else ""
+            return parse_llm_response(retry_text)
         except Exception as exc:
             logger.warning("[NAIPrompt] LLM 解析失败: %s", exc)
             return None
@@ -139,8 +164,8 @@ class NaiPromptPlugin(Star):
     async def _lookup_characters(self, parsed: ParsedRequest):
         if self.lookup is None:
             return []
-        candidates = parsed.character_candidates[:20]
-        results = await asyncio.gather(*(self.lookup.lookup(candidate) for candidate in candidates))
+        requests = parsed.characters[:20]
+        results = await asyncio.gather(*(self.lookup.lookup(request) for request in requests))
         return [result for result in results if result is not None]
 
     @filter.command("提示词")
@@ -163,9 +188,9 @@ class NaiPromptPlugin(Star):
             return
 
         parsed = await self._parse_with_llm(event, description)
-        used_fallback = parsed is None
         if parsed is None:
-            parsed = fallback_parse(description)
+            yield event.plain_result("提示词解析失败，请稍后重试。")
+            return
         characters = await self._lookup_characters(parsed)
         result = build_prompt(
             parsed=parsed,
@@ -173,6 +198,6 @@ class NaiPromptPlugin(Star):
             lookup_results=characters,
             allow_adult=self._cfg_bool("allow_adult_prompts", True),
             max_length=self._cfg_int("max_prompt_length", 1800, 200, 5000),
-            used_fallback=used_fallback,
+            used_fallback=False,
         )
         yield event.plain_result(format_result(result))

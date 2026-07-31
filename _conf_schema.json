@@ -10,19 +10,14 @@
     "description": "同一用户两次生成之间的冷却秒数；设为 0 关闭。",
     "default": 5
   },
-  "seaart_enabled": {
-    "type": "bool",
-    "description": "Danbooru 未命中角色标签时，尝试 SeaArt 公开页面检索。",
-    "default": true
-  },
   "request_timeout_seconds": {
     "type": "int",
-    "description": "Danbooru / SeaArt 外部请求超时秒数（2-15）。",
-    "default": 5
+    "description": "每个 SeaArt / Danbooru HTTP 请求的超时秒数（2-15）。",
+    "default": 15
   },
   "proxy_url": {
     "type": "string",
-    "description": "仅用于 Danbooru 与 SeaArt 标签检索的可选 HTTP(S) 代理，例如 http://127.0.0.1:7890。",
+    "description": "仅用于 SeaArt 与 Danbooru 标签检索的可选 HTTP(S) 代理，例如 http://127.0.0.1:7890。",
     "default": ""
   },
   "allow_adult_prompts": {

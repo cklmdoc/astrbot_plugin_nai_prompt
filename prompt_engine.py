@@ -1,4 +1,4 @@
-"""NAI prompt parsing, character tag lookup and safe prompt rendering."""
+"""NAI prompt parsing, SeaArt-first character tag lookup and safe rendering."""
 
 from __future__ import annotations
 
@@ -15,42 +15,35 @@ import aiohttp
 
 POSITIVE_BASE = ["masterpiece", "best quality"]
 NEGATIVE_BASE = [
-    "bad_hands",
-    "extra_fingers",
-    "deformed_hands",
-    "lowres",
-    "worst_quality",
-    "bad_anatomy",
-    "blurry",
-    "distorted",
-    "ugly",
+    "bad_hands", "extra_fingers", "deformed_hands", "lowres", "worst_quality",
+    "bad_anatomy", "blurry", "distorted", "ugly",
 ]
-
-# These terms flag a request which must never produce explicit sexual content.
 MINOR_MARKERS = ("未成年", "小学生", "初中生", "幼女", "儿童", "童颜")
 ADULT_MARKERS = ("r18", "r-18", "成人向", "色情", "全裸", "裸体", "露点", "涩涩", "瑟瑟", "做爱", "性交")
 
-# Intentionally small, conservative fallback vocabulary. Unknown details are not invented.
-FALLBACK_MAP: dict[str, list[str]] = {
-    "绿头发": ["green_hair"], "绿色头发": ["green_hair"],
-    "蓝头发": ["blue_hair"], "粉头发": ["pink_hair"],
-    "白头发": ["white_hair"], "黑头发": ["black_hair"],
-    "金发": ["blonde_hair"], "银发": ["silver_hair"],
-    "双马尾": ["twintails"], "长发": ["long_hair"], "短发": ["short_hair"],
-    "猫耳": ["cat_ears"], "兔耳": ["rabbit_ears"], "狐耳": ["fox_ears"],
-    "校服": ["school_uniform"], "连衣裙": ["dress"], "裙子": ["skirt"],
-    "微笑": ["smile"], "笑": ["smile"], "脸红": ["blush"],
-    "拥抱": ["hug"], "牵手": ["holding_hands"], "坐": ["sitting"], "站": ["standing"],
-    "樱花": ["cherry_blossoms"], "花园": ["garden"], "海边": ["beach"],
-    "室内": ["indoors"], "室外": ["outdoors"], "夜晚": ["night"],
+
+SEAART_DROP_EXACT = {
+    "masterpiece", "best_quality", "best quality", "absurdres", "very_aesthetic",
+    "highres", "ultra_detailed", "highly_detailed", "scenery", "outdoors", "indoors",
+    "looking_at_viewer", "simple_background", "white_background", "watermark", "signature",
+    "text", "lowres", "worst_quality", "bad_anatomy", "bad_hands", "blurry",
 }
+SEAART_DROP_PREFIXES = ("artist:", "bad_", "negative_", "no_")
+SEAART_TAG_LIMIT = 20
+SEAART_DETAIL_LIMIT = 3
+
+
+@dataclass
+class CharacterRequest:
+    display_name: str = ""
+    danbooru_tag: str = ""
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ParsedRequest:
-    character_candidates: list[str] = field(default_factory=list)
-    character_groups: list[list[str]] = field(default_factory=list)
-    subject_tags: list[str] = field(default_factory=list)
+    characters: list[CharacterRequest] = field(default_factory=list)
+    shared_tags: list[str] = field(default_factory=list)
     outfit_tags: list[str] = field(default_factory=list)
     action_tags: list[str] = field(default_factory=list)
     scene_tags: list[str] = field(default_factory=list)
@@ -60,7 +53,8 @@ class ParsedRequest:
 
 @dataclass
 class CharacterTags:
-    name: str
+    display_name: str
+    danbooru_tag: str
     tags: list[str]
     source: str
 
@@ -76,17 +70,22 @@ class PromptResult:
     multi_character_note: bool = False
 
 
-def _as_tag_list(value: Any, limit: int = 80) -> list[str]:
+def _as_tag_list(value: Any, limit: int = 80, allow_weights: bool = False) -> list[str]:
     if not isinstance(value, list):
         return []
     result: list[str] = []
+    tag_pattern = r"(?:[a-z0-9_()\-]+|(?:0?\.[5-9]|1(?:\.\d+)?)::[a-z0-9_()\-]+::)"
     for item in value[:limit]:
         if not isinstance(item, str):
             continue
         tag = item.strip().lower().replace(" ", "_")
-        if re.fullmatch(r"[a-z0-9_()\-]+", tag) and tag:
+        if re.fullmatch(tag_pattern if allow_weights else r"[a-z0-9_()\-]+", tag) and tag:
             result.append(tag)
     return result
+
+
+def _as_single_tag(value: Any) -> str:
+    return _as_tag_list([value], 1)[0] if isinstance(value, str) and _as_tag_list([value], 1) else ""
 
 
 def _unique(tags: list[str]) -> list[str]:
@@ -95,7 +94,6 @@ def _unique(tags: list[str]) -> list[str]:
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
-    """Accept a JSON object optionally wrapped in a markdown code fence."""
     match = re.search(r"\{.*\}", text.strip(), flags=re.DOTALL)
     if not match:
         return None
@@ -110,56 +108,44 @@ def parse_llm_response(text: str) -> ParsedRequest | None:
     data = extract_json(text)
     if data is None:
         return None
-    groups_raw = data.get("character_groups")
-    groups: list[list[str]] = []
-    if isinstance(groups_raw, list):
-        groups = [_as_tag_list(group, 40) for group in groups_raw if isinstance(group, list)]
-        groups = [group for group in groups if group]
-    candidates = _as_tag_list(data.get("character_candidates"), 20)
-    level = str(data.get("nsfw_level", "safe")).lower()
+    required_arrays = ("characters", "shared_tags", "outfit_tags", "action_tags", "scene_tags", "style_tags")
+    if any(key not in data or not isinstance(data[key], list) for key in required_arrays):
+        return None
+    characters: list[CharacterRequest] = []
+    for item in data["characters"][:20]:
+        if not isinstance(item, dict):
+            return None
+        if not {"display_name", "danbooru_tag", "tags"}.issubset(item):
+            return None
+        if not isinstance(item["display_name"], str) or not isinstance(item["danbooru_tag"], str):
+            return None
+        if not isinstance(item["tags"], list):
+            return None
+        display_name = item["display_name"].strip()[:100]
+        danbooru_tag = _as_single_tag(item["danbooru_tag"])
+        tags = _as_tag_list(item["tags"], 40)
+        characters.append(CharacterRequest(display_name, danbooru_tag, tags))
+    level = data.get("nsfw_level")
     if level not in {"safe", "suggestive", "explicit"}:
-        level = "safe"
+        return None
     return ParsedRequest(
-        character_candidates=candidates,
-        character_groups=groups,
-        subject_tags=_as_tag_list(data.get("subject_tags")),
-        outfit_tags=_as_tag_list(data.get("outfit_tags")),
-        action_tags=_as_tag_list(data.get("action_tags")),
-        scene_tags=_as_tag_list(data.get("scene_tags")),
-        style_tags=_as_tag_list(data.get("style_tags")),
+        characters=characters,
+        shared_tags=_as_tag_list(data["shared_tags"]),
+        outfit_tags=_as_tag_list(data["outfit_tags"]),
+        action_tags=_as_tag_list(data["action_tags"]),
+        scene_tags=_as_tag_list(data["scene_tags"]),
+        style_tags=_as_tag_list(data["style_tags"], allow_weights=True),
         nsfw_level=level,
     )
 
 
-def fallback_parse(description: str) -> ParsedRequest:
-    tags: list[str] = []
-    for chinese, mapped in FALLBACK_MAP.items():
-        if chinese in description:
-            tags.extend(mapped)
-    # Conservative estimate; do not claim a gender when not specified.
-    if any(word in description for word in ("两个", "两位", "二人", "双人")):
-        tags.insert(0, "2girls" if "少女" in description or "女孩" in description else "2people")
-    elif any(word in description for word in ("少女", "女孩", "女生", "女人")):
-        tags.insert(0, "1girl")
-    elif any(word in description for word in ("男孩", "男生", "男人")):
-        tags.insert(0, "1boy")
-    else:
-        tags.insert(0, "solo")
-    level = "explicit" if any(marker in description.lower() for marker in ADULT_MARKERS) else "safe"
-    return ParsedRequest(subject_tags=_unique(tags), nsfw_level=level)
-
-
 def safe_nsfw_level(description: str, requested: str, allow_adult: bool) -> str:
+    if any(marker in description for marker in MINOR_MARKERS) or not allow_adult:
+        return "safe"
     lowered = description.lower()
-    if any(marker in description for marker in MINOR_MARKERS):
-        return "safe"
-    if not allow_adult:
-        return "safe"
     if requested == "explicit" and any(marker in lowered for marker in ADULT_MARKERS):
         return "explicit"
-    if requested == "suggestive" or "擦边" in description:
-        return "suggestive"
-    return "safe"
+    return "suggestive" if requested == "suggestive" or "擦边" in description else "safe"
 
 
 def nsfw_tags(level: str) -> list[str]:
@@ -170,29 +156,53 @@ def nsfw_tags(level: str) -> list[str]:
     return ["cute"]
 
 
+def clean_seaart_tags(tags: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for tag in _unique(_as_tag_list(tags, 200)):
+        if tag in SEAART_DROP_EXACT or tag.startswith(SEAART_DROP_PREFIXES):
+            continue
+        if any(word in tag for word in ("watermark", "signature", "quality", "resolution")):
+            continue
+        cleaned.append(tag)
+        if len(cleaned) == SEAART_TAG_LIMIT:
+            break
+    return cleaned
+
+
 class TagLookup:
-    """Network tag lookup with a successful-result-only, 24-hour memory cache."""
+    """SeaArt-first tag lookup with 24-hour successful-result alias caching."""
 
     CACHE_TTL = 86400
 
-    def __init__(self, timeout_seconds: int = 5, proxy_url: str = "", seaart_enabled: bool = True):
+    def __init__(self, timeout_seconds: int = 5, proxy_url: str = ""):
         self.timeout_seconds = max(2, min(15, int(timeout_seconds)))
         self.proxy_url = proxy_url or None
-        self.seaart_enabled = seaart_enabled
         self._cache: dict[str, tuple[float, CharacterTags]] = {}
 
-    async def lookup(self, candidate: str) -> CharacterTags | None:
-        candidate = candidate.strip().lower().replace(" ", "_")
-        if not candidate:
+    @staticmethod
+    def _key(value: str) -> str:
+        return value.strip().lower().replace(" ", "_")
+
+    async def lookup(self, request: CharacterRequest) -> CharacterTags | None:
+        keys = [self._key(value) for value in (request.display_name, request.danbooru_tag) if value.strip()]
+        for key in keys:
+            cached = self._cache.get(key)
+            if cached and time.monotonic() - cached[0] < self.CACHE_TTL:
+                return cached[1]
+
+        seaart = await self._seaart(request)
+        canonical = await self._danbooru(request.danbooru_tag) if request.danbooru_tag else None
+        if seaart:
+            tags = _unique(([canonical] if canonical else []) + seaart)
+            result = CharacterTags(request.display_name, canonical or request.danbooru_tag, tags, "SeaArt + Danbooru 角色标识" if canonical else "SeaArt")
+        elif canonical:
+            result = CharacterTags(request.display_name, canonical, [canonical], "Danbooru")
+        else:
             return None
-        cached = self._cache.get(candidate)
-        if cached and time.monotonic() - cached[0] < self.CACHE_TTL:
-            return cached[1]
-        result = await self._danbooru(candidate)
-        if result is None and self.seaart_enabled:
-            result = await self._seaart(candidate)
-        if result is not None:
-            self._cache[candidate] = (time.monotonic(), result)
+
+        for key in keys + ([self._key(canonical)] if canonical else []):
+            if key:
+                self._cache[key] = (time.monotonic(), result)
         return result
 
     async def _get(self, url: str) -> str | None:
@@ -201,14 +211,14 @@ class TagLookup:
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(url, proxy=self.proxy_url) as response:
-                    if response.status != 200:
-                        return None
-                    return await response.text()
+                    return await response.text() if response.status == 200 else None
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return None
 
-    async def _danbooru(self, candidate: str) -> CharacterTags | None:
-        # Exact name is deliberately used; fuzzy name_matches can return unrelated characters.
+    async def _danbooru(self, candidate: str) -> str | None:
+        candidate = self._key(candidate)
+        if not candidate:
+            return None
         url = "https://danbooru.donmai.us/tags.json?search[name_matches]=" + quote_plus(candidate) + "&search[category]=4"
         raw = await self._get(url)
         if raw is None:
@@ -217,80 +227,129 @@ class TagLookup:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return None
-        if not isinstance(data, list):
-            return None
-        for item in data:
-            name = item.get("name") if isinstance(item, dict) else None
-            if isinstance(name, str) and name == candidate:
-                return CharacterTags(name=candidate, tags=[name], source="Danbooru")
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, dict) and item.get("name") == candidate:
+                return candidate
         return None
 
-    async def _seaart(self, candidate: str) -> CharacterTags | None:
-        # Public search fallback: it deliberately only accepts explicit, tag-shaped data.
-        url = "https://www.seaart.ai/search?q=" + quote_plus(candidate)
-        raw = await self._get(url)
-        if raw is None:
-            return None
-        found = re.findall(r"(?:Training Tags|Prompt Tags)\s*[:：]\s*([^<\n]{3,500})", html.unescape(raw), re.I)
-        for value in found:
-            tags = _as_tag_list(re.split(r"[,，]", value), 40)
+    @staticmethod
+    def _walk(value: Any):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from TagLookup._walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from TagLookup._walk(child)
+
+    @staticmethod
+    def _title_matches(item: dict[str, Any], request: CharacterRequest) -> bool:
+        haystack = " ".join(
+            str(item.get(key, ""))
+            for key in ("title", "name", "modelName", "character", "tags")
+        ).lower()
+        candidates = [request.display_name.lower(), request.danbooru_tag.lower().replace("_", " ")]
+        return any(candidate and candidate in haystack for candidate in candidates)
+
+    @staticmethod
+    def _tag_value(item: dict[str, Any]) -> list[str]:
+        for key, value in item.items():
+            normalized = key.lower().replace("_", " ")
+            if normalized in {"training tags", "prompt tags", "trainingtags", "prompttags"}:
+                if isinstance(value, str):
+                    return re.split(r"[,，]", value)
+                if isinstance(value, list):
+                    return [str(part) for part in value]
+        return []
+
+    @staticmethod
+    def _detail_urls(item: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for key, value in item.items():
+            if key.lower() in {"url", "detailurl", "modelurl", "link", "href"} and isinstance(value, str):
+                if value.startswith("/"):
+                    urls.append("https://www.seaart.ai" + value)
+                elif value.startswith("https://www.seaart.ai/"):
+                    urls.append(value)
+        return _unique(urls)
+
+    def _extract_seaart(self, raw: str, request: CharacterRequest) -> tuple[list[str], list[str]]:
+        document = html.unescape(raw)
+        direct = re.findall(r"(?:Training Tags|Prompt Tags)\s*[:：]\s*([^<\n]{3,1000})", document, re.I)
+        for value in direct:
+            tags = clean_seaart_tags(re.split(r"[,，]", value))
             if tags:
-                return CharacterTags(name=candidate, tags=tags, source="SeaArt")
+                return tags, []
+
+        objects: list[dict[str, Any]] = []
+        for payload in re.findall(r"<script[^>]*>(\{.*?\})</script>", document, re.S):
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            objects.extend(node for node in self._walk(parsed) if isinstance(node, dict))
+        urls: list[str] = []
+        for item in objects:
+            if not self._title_matches(item, request):
+                continue
+            tags = clean_seaart_tags(self._tag_value(item))
+            if tags:
+                return tags, []
+            urls.extend(self._detail_urls(item))
+        return [], _unique(urls)[:SEAART_DETAIL_LIMIT]
+
+    async def _seaart(self, request: CharacterRequest) -> list[str] | None:
+        search_terms = [request.display_name.strip(), request.danbooru_tag.strip()]
+        for term in _unique([term for term in search_terms if term]):
+            suffix = " AI模型" if term == request.display_name.strip() else ""
+            raw = await self._get("https://www.seaart.ai/search?q=" + quote_plus(term + suffix))
+            if raw is None:
+                continue
+            tags, detail_urls = self._extract_seaart(raw, request)
+            if tags:
+                return tags
+            for url in detail_urls:
+                detail = await self._get(url)
+                if detail is None:
+                    continue
+                tags, _ = self._extract_seaart(detail, request)
+                if tags:
+                    return tags
         return None
 
 
 def build_prompt(parsed: ParsedRequest, description: str, lookup_results: list[CharacterTags], allow_adult: bool, max_length: int, used_fallback: bool = False) -> PromptResult:
     level = safe_nsfw_level(description, parsed.nsfw_level, allow_adult)
     character_tags = _unique([tag for result in lookup_results for tag in result.tags])
-    source = " + ".join(_unique([result.source for result in lookup_results]))
-    if not source:
-        source = "OC 转换（未获取到可验证的角色训练标签）"
-
+    source = " + ".join(_unique([result.source for result in lookup_results])) or "OC 转换（未获取到可验证的角色训练标签）"
+    user_character_tags = [tag for character in parsed.characters for tag in character.tags]
     all_tags = _unique(
-        POSITIVE_BASE + parsed.subject_tags + character_tags + parsed.outfit_tags
+        POSITIVE_BASE + parsed.shared_tags + character_tags + user_character_tags + parsed.outfit_tags
         + parsed.action_tags + parsed.scene_tags + parsed.style_tags + nsfw_tags(level)
     )
     max_length = max(200, min(5000, int(max_length)))
     selected: list[str] = []
     for tag in all_tags:
-        candidate = ", ".join(selected + [tag])
-        if len(candidate) > max_length:
+        if len(", ".join(selected + [tag])) > max_length:
             break
         selected.append(tag)
-    positive = ", ".join(selected)
     return PromptResult(
-        positive=positive,
-        negative=", ".join(NEGATIVE_BASE),
-        character_tags=character_tags,
-        source=source,
-        nsfw_level={"safe": "全年龄", "suggestive": "擦边", "explicit": "成人向"}[level],
+        positive=", ".join(selected), negative=", ".join(NEGATIVE_BASE), character_tags=character_tags,
+        source=source, nsfw_level={"safe": "全年龄", "suggestive": "擦边", "explicit": "成人向"}[level],
         used_fallback=used_fallback,
-        multi_character_note=len(lookup_results) >= 2 or len(parsed.character_groups) >= 2,
+        multi_character_note=len(parsed.characters) >= 2,
     )
 
 
 def format_result(result: PromptResult) -> str:
     char_tags = ", ".join(result.character_tags) if result.character_tags else "未识别到可验证角色标签"
     lines = [
-        "┌─ NAI 提示词生成 ─────────",
-        f"│ 标签来源：{result.source}",
-        f"│ NSFW 等级：{result.nsfw_level}",
-        "├─ 角色标签",
-        f"│ {char_tags}",
-        "├─ 正面 Prompt",
-        "```text",
-        result.positive,
-        "```",
-        "├─ 负面 Prompt",
-        "```text",
-        result.negative,
-        "```",
+        "┌─ NAI 提示词生成 ─────────", f"│ 标签来源：{result.source}", f"│ NSFW 等级：{result.nsfw_level}",
+        "├─ 角色标签", f"│ {char_tags}", "├─ 正面 Prompt", "```text", result.positive, "```",
+        "├─ 负面 Prompt", "```text", result.negative, "```",
     ]
     if result.multi_character_note:
-        lines.extend([
-            "├─ NAI V4 多角色建议",
-            "│ 将每位角色专属标签分别填入 Character Prompting；动作、互动和场景保留在主 Prompt。",
-        ])
+        lines.extend(["├─ NAI V4 多角色建议", "│ 将每位角色专属标签分别填入 Character Prompting；动作、互动和场景保留在主 Prompt。"])
     if result.used_fallback:
         lines.append("│ 解析服务暂不可用，已使用基础标签转换。")
     lines.append("└────────────────────────")
