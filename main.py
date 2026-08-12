@@ -12,6 +12,7 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 
@@ -280,10 +281,34 @@ class NaiPromptPlugin(Star):
         """
         return IMAGE_URL_PATTERN.sub("", description).strip()
 
+    @staticmethod
+    def _message_components(event: AstrMessageEvent) -> list:
+        """获取消息链组件列表，兼容不同 AstrBot 版本的取数 API。
+
+        Args:
+            event: 消息事件
+
+        Returns:
+            消息组件列表（可能为空）
+        """
+        for method in ("get_message", "get_messages"):
+            getter = getattr(event, method, None)
+            if not callable(getter):
+                continue
+            try:
+                chain = getter()
+            except Exception:
+                continue
+            if isinstance(chain, list):
+                return chain
+        message = getattr(getattr(event, "message_obj", None), "message", None)
+        return message if isinstance(message, list) else []
+
     async def _first_image_source(self, event: AstrMessageEvent) -> str | None:
         """取消息附带的第一张图片的本地路径或远程 URL。
 
-        优先返回本地已存在路径（读取可靠），否则返回远程 URL。
+        通过消息链 Image 组件定位图片（AstrBot 标准 API），
+        优先返回本地已存在路径（读取可靠），否则返回远程 URL；无图片返回 None。
 
         Args:
             event: 消息事件
@@ -291,9 +316,32 @@ class NaiPromptPlugin(Star):
         Returns:
             图片来源（路径或 URL）；无图片返回 None
         """
-        message_obj = getattr(event, "message_obj", None)
-        images = getattr(message_obj, "image", None) or []
-        for image in images:
+        for component in self._message_components(event):
+            is_image = isinstance(component, Image) or component.__class__.__name__.lower() == "image"
+            if not is_image:
+                continue
+            path = getattr(component, "path", None) or ""
+            url = getattr(component, "url", None) or ""
+            file_ref = getattr(component, "file", None) or ""
+            if isinstance(path, str) and path and os.path.exists(path):
+                return path
+            # 部分适配器仅提供需鉴权的远程 URL，优先用适配器落盘接口取本地路径
+            converter = getattr(component, "convert_to_file_path", None)
+            if callable(converter):
+                try:
+                    local = await converter()
+                except Exception:
+                    local = None
+                if isinstance(local, str) and local and os.path.exists(local):
+                    return local
+            if isinstance(url, str) and url:
+                return url
+            if isinstance(file_ref, str) and file_ref and (
+                os.path.exists(file_ref) or file_ref.startswith(("http://", "https://"))
+            ):
+                return file_ref
+        # 兜底：部分平台版本将图片挂在 message_obj.image
+        for image in getattr(getattr(event, "message_obj", None), "image", None) or []:
             path = getattr(image, "path", None) or ""
             url = getattr(image, "url", None) or ""
             if isinstance(path, str) and path and os.path.exists(path):
