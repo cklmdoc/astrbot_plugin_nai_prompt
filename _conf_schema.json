@@ -33,9 +33,9 @@
   },
   "tagger_api_url": {
     "type": "string",
-    "description": "图像反推 Tagger API 基址（Gradio 3.x/4.x 协议均可）。",
-    "hint": "默认 https://smilingwolf-wd-swinv2-tagger-v3.hf.space；末尾 / 会自动忽略。",
-    "default": "https://smilingwolf-wd-swinv2-tagger-v3.hf.space"
+    "description": "图像反推 Tagger API 基址（Gradio 新协议/3.x 协议均可）。",
+    "hint": "默认 https://smilingwolf-wd-tagger.hf.space；末尾 / 会自动忽略。",
+    "default": "https://smilingwolf-wd-tagger.hf.space"
   },
   "tagger_timeout_seconds": {
     "type": "int",

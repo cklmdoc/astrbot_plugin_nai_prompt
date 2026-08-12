@@ -23,6 +23,6 @@ AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI �
 
 DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若不可用或角色匹配分数不足，插件仍输出 LLM 转译结果。
 
-图反推默认 API：`https://smilingwolf-wd-swinv2-tagger-v3.hf.space`（Gradio 3.x/4.x 协议均可），可在配置中替换为自建镜像。
+图反推默认 API：`https://smilingwolf-wd-tagger.hf.space`（Gradio 新协议/3.x 协议均可），可在配置中替换为自建镜像。
 
 成人向仅在 LLM 标记角色为 `adult` 且 `allow_adult_prompts=true` 时启用；其它情况均生成全年龄版本。

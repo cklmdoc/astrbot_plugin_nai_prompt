@@ -16,8 +16,8 @@ DANBOORU_SEARCH_API_DEFAULT = "https://sakizuki-danboorusearch.hf.space/api"
 CHARACTER_SCORE_THRESHOLD = 0.55
 RELATED_TAG_LIMIT = 12
 
-TAGGER_API_DEFAULT = "https://smilingwolf-wd-swinv2-tagger-v3.hf.space"
-TAGGER_MODEL = "SwinV2"
+TAGGER_API_DEFAULT = "https://smilingwolf-wd-tagger.hf.space"
+TAGGER_MODEL = "SmilingWolf/wd-swinv2-tagger-v3"
 
 POSITIVE_BASE = ["masterpiece", "best quality"]
 NEGATIVE_BASE = [
@@ -239,10 +239,10 @@ class DanbooruSearchLookup:
 
 
 class ImageTaggerClient:
-    """公网 WD14 图像标签反推客户端，兼容 Gradio 3.x 与 4.x 协议。
+    """公网 WD14 图像标签反推客户端，兼容 Gradio 新协议（4.x/6.x 两步流程）与 3.x 单次请求。
 
     将图片字节反推为 Danbooru/NAI 风格标签列表，供 /提示词 命令的图片分支使用。
-    优先尝试 Gradio 4.x 两步流程（POST 提交 + SSE 拉取结果），失败后回退 3.x 单次请求。
+    优先尝试新协议（POST 提交 + SSE 拉取结果），失败后回退 3.x 单次请求。
 
     属性:
         api_url: Tagger 服务基址，末尾 / 会自动忽略
@@ -287,16 +287,23 @@ class ImageTaggerClient:
         return f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 
     def _payload(self, data_uri: str) -> dict[str, Any]:
-        """构建 Gradio /predict 的标准请求体（含模型选择与置信度阈值）。
+        """构建 Gradio 新协议命名参数请求体（图片 + 模型 + 双阈值）。
 
         Args:
             data_uri: 图片 data URI
 
         Returns:
-            {"data": [data_uri, 模型名, 通用阈值, 角色阈值]}
+            命名参数字典，image 为 gradio.FileData 对象，模型与阈值使用配置值
         """
         threshold = self.confidence_threshold
-        return {"data": [data_uri, TAGGER_MODEL, threshold, threshold]}
+        return {
+            "image": {"path": data_uri, "meta": {"_type": "gradio.FileData"}},
+            "model_repo": TAGGER_MODEL,
+            "general_thresh": threshold,
+            "general_mcut_enabled": False,
+            "character_thresh": threshold,
+            "character_mcut_enabled": False,
+        }
 
     @staticmethod
     def _parse_sse_data(text: str) -> Any:
@@ -323,7 +330,8 @@ class ImageTaggerClient:
     def _extract_tags(data: Any) -> list[str]:
         """从 Gradio 响应 data 中提取合法的 Danbooru 标签列表。
 
-        兼容两种输出形态：逗号拼接的标签字符串（Textbox）与 {"label": ...} 列表（Json 组件）。
+        新协议输出为 4 元素数组 [标签串, Rating, General, Character]，仅取 data[0] 标签串；
+        同时兼容旧协议形态（逗号拼接字符串 / {"label": ...} 列表）。
 
         Args:
             data: Gradio 响应的 data 字段
@@ -345,8 +353,12 @@ class ImageTaggerClient:
             if tag and re.fullmatch(r"[a-z0-9_()\-]+", tag):
                 tags.append(tag)
 
-        if not isinstance(data, list):
+        if not isinstance(data, list) or not data:
             return []
+        if isinstance(data[0], str):
+            for part in data[0].split(","):
+                append_tag(part)
+            return _unique(tags)
         for entry in data:
             if isinstance(entry, str):
                 for part in entry.split(","):
@@ -362,28 +374,31 @@ class ImageTaggerClient:
         return _unique(tags)
 
     async def _predict_v4(self, session: aiohttp.ClientSession, payload: dict[str, Any]) -> list[str] | None:
-        """走 Gradio 4.x 两步流程：POST 提交拿 event_id，GET 拉取 SSE 结果。
+        """走 Gradio 新协议两步流程：POST 提交拿 event_id，GET 拉取 SSE 结果。
 
         Args:
             session: 共享 aiohttp 会话
-            payload: 预测请求体
+            payload: 命名参数请求体
 
         Returns:
             标签列表；失败返回 None
         """
         try:
-            async with session.post(f"{self.api_url}/gradio_api/call/predict", json=payload) as response:
+            async with session.post(f"{self.api_url}/gradio_api/call/v2/predict", json=payload) as response:
                 if response.status != 200:
                     return None
                 body = await response.json(content_type=None)
             event_id = body.get("event_id") if isinstance(body, dict) else None
             if not event_id:
                 return None
-            async with session.get(f"{self.api_url}/gradio_api/call/predict/{event_id}") as response:
-                if response.status != 200:
-                    return None
-                text = await response.text()
-            return self._extract_tags(self._parse_sse_data(text))
+            # SSE 拉取 URL 通常与提交 URL 同前缀；部分镜像仅暴露非 v2 前缀，逐一尝试
+            for prefix in (f"{self.api_url}/gradio_api/call/v2/predict", f"{self.api_url}/gradio_api/call/predict"):
+                async with session.get(f"{prefix}/{event_id}") as response:
+                    if response.status != 200:
+                        continue
+                    text = await response.text()
+                    return self._extract_tags(self._parse_sse_data(text))
+            return None
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             return None
 
@@ -410,7 +425,7 @@ class ImageTaggerClient:
     async def tag_image(self, image_bytes: bytes) -> list[str]:
         """将图片字节反推为 Danbooru 标签列表。
 
-        优先尝试 Gradio 4.x 协议，失败后回退 3.x；响应为空时用最小请求体重试一次
+        优先尝试 Gradio 新协议（两步流程），失败后回退 3.x；响应为空时用最小请求体重试一次
         （部分简化镜像只暴露图片一个入参）。全部失败返回空列表。
 
         Args:
@@ -428,7 +443,7 @@ class ImageTaggerClient:
             if tags is None:
                 tags = await self._predict_v3(session, payload)
             if not tags:
-                minimal = {"data": [data_uri]}
+                minimal = {"image": {"path": data_uri, "meta": {"_type": "gradio.FileData"}}}
                 tags = await self._predict_v4(session, minimal)
                 if tags is None:
                     tags = await self._predict_v3(session, minimal)
