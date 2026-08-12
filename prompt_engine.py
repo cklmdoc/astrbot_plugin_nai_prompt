@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
@@ -14,6 +15,9 @@ import aiohttp
 DANBOORU_SEARCH_API_DEFAULT = "https://sakizuki-danboorusearch.hf.space/api"
 CHARACTER_SCORE_THRESHOLD = 0.55
 RELATED_TAG_LIMIT = 12
+
+TAGGER_API_DEFAULT = "https://smilingwolf-wd-swinv2-tagger-v3.hf.space"
+TAGGER_MODEL = "SwinV2"
 
 POSITIVE_BASE = ["masterpiece", "best quality"]
 NEGATIVE_BASE = [
@@ -232,6 +236,203 @@ class DanbooruSearchLookup:
         result = CharacterTags(request.display_name, canonical_tag, [canonical_tag] + related_tags)
         self._cache[key] = (time.monotonic(), result)
         return result
+
+
+class ImageTaggerClient:
+    """公网 WD14 图像标签反推客户端，兼容 Gradio 3.x 与 4.x 协议。
+
+    将图片字节反推为 Danbooru/NAI 风格标签列表，供 /提示词 命令的图片分支使用。
+    优先尝试 Gradio 4.x 两步流程（POST 提交 + SSE 拉取结果），失败后回退 3.x 单次请求。
+
+    属性:
+        api_url: Tagger 服务基址，末尾 / 会自动忽略
+        timeout_seconds: 单次请求超时秒数（5-60）
+        confidence_threshold: 标签置信度阈值（0-1），低于该值的标签被过滤
+    """
+
+    def __init__(
+        self,
+        api_url: str = TAGGER_API_DEFAULT,
+        timeout_seconds: int = 30,
+        confidence_threshold: float = 0.35,
+    ):
+        """初始化图片反推客户端。
+
+        Args:
+            api_url: Tagger API 基址，可填自建镜像
+            timeout_seconds: 请求超时秒数
+            confidence_threshold: 标签置信度阈值
+        """
+        self.api_url = (api_url or TAGGER_API_DEFAULT).rstrip("/")
+        self.timeout_seconds = max(5, min(60, int(timeout_seconds)))
+        self.confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
+
+    @staticmethod
+    def _data_uri(image_bytes: bytes) -> str:
+        """将图片字节转为带 MIME 嗅探的 base64 data URI，供 Gradio file 组件接收。
+
+        Args:
+            image_bytes: 原始图片字节
+
+        Returns:
+            形如 data:image/jpeg;base64,xxx 的 data URI 字符串
+        """
+        mime = "image/jpeg"
+        if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            mime = "image/png"
+        elif image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+            mime = "image/gif"
+        elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            mime = "image/webp"
+        return f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+    def _payload(self, data_uri: str) -> dict[str, Any]:
+        """构建 Gradio /predict 的标准请求体（含模型选择与置信度阈值）。
+
+        Args:
+            data_uri: 图片 data URI
+
+        Returns:
+            {"data": [data_uri, 模型名, 通用阈值, 角色阈值]}
+        """
+        threshold = self.confidence_threshold
+        return {"data": [data_uri, TAGGER_MODEL, threshold, threshold]}
+
+    @staticmethod
+    def _parse_sse_data(text: str) -> Any:
+        """从 Gradio 4.x SSE 响应文本中提取最后一个 data 负载。
+
+        Args:
+            text: SSE 流响应文本
+
+        Returns:
+            JSON 解析后的最后一个 data 值；无有效负载返回 None
+        """
+        result: Any = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                result = json.loads(line[len("data:"):].strip())
+            except json.JSONDecodeError:
+                continue
+        return result
+
+    @staticmethod
+    def _extract_tags(data: Any) -> list[str]:
+        """从 Gradio 响应 data 中提取合法的 Danbooru 标签列表。
+
+        兼容两种输出形态：逗号拼接的标签字符串（Textbox）与 {"label": ...} 列表（Json 组件）。
+
+        Args:
+            data: Gradio 响应的 data 字段
+
+        Returns:
+            去重后的标签列表
+        """
+        tags: list[str] = []
+
+        def append_tag(value: Any) -> None:
+            """清洗并追加单个标签。
+
+            Args:
+                value: 原始标签值，非字符串直接忽略
+            """
+            if not isinstance(value, str):
+                return
+            tag = value.strip().lower().replace(" ", "_")
+            if tag and re.fullmatch(r"[a-z0-9_()\-]+", tag):
+                tags.append(tag)
+
+        if not isinstance(data, list):
+            return []
+        for entry in data:
+            if isinstance(entry, str):
+                for part in entry.split(","):
+                    append_tag(part)
+            elif isinstance(entry, list):
+                for item in entry:
+                    if isinstance(item, dict) and isinstance(item.get("label"), str):
+                        append_tag(item["label"])
+                    else:
+                        append_tag(item)
+            elif isinstance(entry, dict) and isinstance(entry.get("label"), str):
+                append_tag(entry["label"])
+        return _unique(tags)
+
+    async def _predict_v4(self, session: aiohttp.ClientSession, payload: dict[str, Any]) -> list[str] | None:
+        """走 Gradio 4.x 两步流程：POST 提交拿 event_id，GET 拉取 SSE 结果。
+
+        Args:
+            session: 共享 aiohttp 会话
+            payload: 预测请求体
+
+        Returns:
+            标签列表；失败返回 None
+        """
+        try:
+            async with session.post(f"{self.api_url}/gradio_api/call/predict", json=payload) as response:
+                if response.status != 200:
+                    return None
+                body = await response.json(content_type=None)
+            event_id = body.get("event_id") if isinstance(body, dict) else None
+            if not event_id:
+                return None
+            async with session.get(f"{self.api_url}/gradio_api/call/predict/{event_id}") as response:
+                if response.status != 200:
+                    return None
+                text = await response.text()
+            return self._extract_tags(self._parse_sse_data(text))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
+    async def _predict_v3(self, session: aiohttp.ClientSession, payload: dict[str, Any]) -> list[str] | None:
+        """走 Gradio 3.x 单次流程：POST /api/predict 直接返回 JSON。
+
+        Args:
+            session: 共享 aiohttp 会话
+            payload: 预测请求体
+
+        Returns:
+            标签列表；失败返回 None
+        """
+        try:
+            async with session.post(f"{self.api_url}/api/predict", json=payload) as response:
+                if response.status != 200:
+                    return None
+                body = await response.json(content_type=None)
+            data = body.get("data") if isinstance(body, dict) else body
+            return self._extract_tags(data)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
+    async def tag_image(self, image_bytes: bytes) -> list[str]:
+        """将图片字节反推为 Danbooru 标签列表。
+
+        优先尝试 Gradio 4.x 协议，失败后回退 3.x；响应为空时用最小请求体重试一次
+        （部分简化镜像只暴露图片一个入参）。全部失败返回空列表。
+
+        Args:
+            image_bytes: 图片原始字节
+
+        Returns:
+            反推得到的标签列表，可能为空
+        """
+        data_uri = self._data_uri(image_bytes)
+        payload = self._payload(data_uri)
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        headers = {"User-Agent": "AstrBot-NAIPrompt/1.0"}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            tags = await self._predict_v4(session, payload)
+            if tags is None:
+                tags = await self._predict_v3(session, payload)
+            if not tags:
+                minimal = {"data": [data_uri]}
+                tags = await self._predict_v4(session, minimal)
+                if tags is None:
+                    tags = await self._predict_v3(session, minimal)
+        return tags or []
 
 
 def build_prompt(parsed: ParsedRequest, lookup_results: list[CharacterTags], allow_adult: bool, max_length: int) -> PromptResult:

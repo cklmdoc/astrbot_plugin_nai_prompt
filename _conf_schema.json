@@ -30,5 +30,26 @@
     "type": "int",
     "description": "最终正面 Prompt 最大字符数。",
     "default": 1800
+  },
+  "tagger_api_url": {
+    "type": "string",
+    "description": "图像反推 Tagger API 基址（Gradio 3.x/4.x 协议均可）。",
+    "hint": "默认 https://smilingwolf-wd-swinv2-tagger-v3.hf.space；末尾 / 会自动忽略。",
+    "default": "https://smilingwolf-wd-swinv2-tagger-v3.hf.space"
+  },
+  "tagger_timeout_seconds": {
+    "type": "int",
+    "description": "图像反推请求超时秒数（5-60），上传图片比纯文本慢。",
+    "default": 30
+  },
+  "tagger_confidence_threshold": {
+    "type": "float",
+    "description": "Tagger 标签置信度阈值（0-1），低于该值的标签被过滤。",
+    "default": 0.35
+  },
+  "max_image_bytes": {
+    "type": "int",
+    "description": "允许反推的最大图片字节数（1-50MB），默认 10MB。",
+    "default": 10485760
   }
 }

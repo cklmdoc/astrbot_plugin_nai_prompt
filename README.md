@@ -13,10 +13,16 @@ AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI �
 ```text
 /提示词 绿色双马尾猫耳少女，穿校服，在樱花树下微笑
 /提示词 流萤和橘望在花园里拥抱
+/提示词 白裙子长头发 + 图片   # 反推图片并可按描述微调
+/提示词 + 图片                # 仅反推图片
 ```
 
-流程：当前会话 LLM 按 JSON 规则转译 → DanbooruSearch 语义搜索角色 → 关联 General 特征增强 → 最终 Prompt 组装。
+图片输入时：命令后附带图片，或在文字中附图片链接即可。插件先经 WD14 Tagger 反推标签，再由 LLM 整理后进入同一流程。
+
+流程：当前会话 LLM 按 JSON 规则转译（图片为 Tagger 标签整理）→ DanbooruSearch 语义搜索角色 → 关联 General 特征增强 → 最终 Prompt 组装。
 
 DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若不可用或角色匹配分数不足，插件仍输出 LLM 转译结果。
+
+图反推默认 API：`https://smilingwolf-wd-swinv2-tagger-v3.hf.space`（Gradio 3.x/4.x 协议均可），可在配置中替换为自建镜像。
 
 成人向仅在 LLM 标记角色为 `adult` 且 `allow_adult_prompts=true` 时启用；其它情况均生成全年龄版本。

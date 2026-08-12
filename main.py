@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
+
+import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -13,8 +17,10 @@ from astrbot.core import AstrBotConfig
 
 from .prompt_engine import (
     DANBOORU_SEARCH_API_DEFAULT,
+    TAGGER_API_DEFAULT,
     CharacterTags,
     DanbooruSearchLookup,
+    ImageTaggerClient,
     ParsedRequest,
     build_prompt,
     extract_json,
@@ -25,9 +31,13 @@ from .prompt_engine import (
 
 HELP_TEXT = """用法：/提示词 <自然语言描述>
 
+支持图片反推：命令后附带图片，或在文字中附图片链接，即可反推并整理 NAI 提示词（可附加文字微调）。
+
 示例：
-/提示词 流萤穿校服，在樱花树下微笑"""
+/提示词 流萤穿校服，在樱花树下微笑
+/提示词 + 图片 → 反推图片中的角色与特征"""
 MAX_DESCRIPTION_LENGTH = 500
+IMAGE_URL_PATTERN = re.compile(r"https?://[^\s]+?\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s]*)?", re.IGNORECASE)
 
 LLM_SYSTEM_PROMPT = """你是 NAI 标签提示词解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
 将用户自然语言转换为紧凑、英文小写 NAI/Danbooru 标签数据。
@@ -78,12 +88,44 @@ JSON schema:
 - 移除与用户指定动作标签语义冲突的标签（如用户指定 running，则移除 standing、sitting 等动作/姿态标签）
 - 保留不冲突的特征标签（如发色、瞳色、体型等）"""
 
+TAGGER_ORGANIZE_SYSTEM_PROMPT = """你是 NAI 标签提示词解析器，负责把图片反推标签整理为合法 JSON。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
+
+输入格式：
+"标签: <WD14/Danbooru 反推标签，逗号分隔>
+描述: <用户附加描述，可为空>"
+
+JSON schema:
+{
+ "characters": [
+   {
+     "display_name": "识别出的角色名（如 hatsune_miku）；未识别到角色填空字符串",
+     "danbooru_tag": "留空字符串；角色标签由插件查询服务确定",
+     "tags": []
+   }
+ ],
+ "shared_tags": ["人数和共享主体标签，如 1girl"],
+ "outfit_tags": ["服装标签"],
+ "action_tags": ["动作和互动标签"],
+ "scene_tags": ["场景、道具、光照或时间标签"],
+ "style_tags": ["少量风格标签，可用 1.2::key_tag:: 强调关键元素"],
+ "nsfw_level": "safe|suggestive|explicit"
+}
+
+规则：
+- 以反推标签为事实来源，将标签按语义归类到上述数组；识别出的角色名标签填入 characters 的 display_name。
+- 用户描述与标签冲突时以用户描述为准（如“去掉校服”“换白色头发”）。
+- 丢弃画师名、masterpiece、best_quality 等通用质量标签。
+- nsfw_level 根据标签判定：含 naked/nipples/pussy 等为 explicit；含 underwear/ecchi 等为 suggestive；否则 safe。
+- 普通标签必须英文小写下划线；不要写完整句子。
+- 未提及的数组必须返回空数组。"""
+
 
 class NaiPromptPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
         self.config = config or {}
         self.lookup: DanbooruSearchLookup | None = None
+        self.tagger: ImageTaggerClient | None = None
         self._last_request: dict[str, float] = {}
 
     async def initialize(self) -> None:
@@ -91,11 +133,17 @@ class NaiPromptPlugin(Star):
             api_url=self._cfg_str("danbooru_search_api_url", DANBOORU_SEARCH_API_DEFAULT),
             timeout_seconds=self._cfg_int("request_timeout_seconds", 5, 2, 15),
         )
+        self.tagger = ImageTaggerClient(
+            api_url=self._cfg_str("tagger_api_url", TAGGER_API_DEFAULT),
+            timeout_seconds=self._cfg_int("tagger_timeout_seconds", 30, 5, 60),
+            confidence_threshold=self._cfg_float("tagger_confidence_threshold", 0.35, 0.0, 1.0),
+        )
         logger.info("[NAIPrompt] 插件已加载")
 
     async def terminate(self) -> None:
         self._last_request.clear()
         self.lookup = None
+        self.tagger = None
         logger.info("[NAIPrompt] 插件已停止")
 
     def _cfg_str(self, key: str, default: str = "") -> str:
@@ -111,6 +159,24 @@ class NaiPromptPlugin(Star):
     def _cfg_int(self, key: str, default: int, minimum: int, maximum: int) -> int:
         try:
             value = int(self.config.get(key, default))
+        except (TypeError, ValueError, AttributeError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _cfg_float(self, key: str, default: float, minimum: float, maximum: float) -> float:
+        """读取浮点配置项并夹取到 [minimum, maximum] 区间。
+
+        Args:
+            key: 配置键名
+            default: 缺省值
+            minimum: 允许的最小值
+            maximum: 允许的最大值
+
+        Returns:
+            夹取后的浮点值
+        """
+        try:
+            value = float(self.config.get(key, default))
         except (TypeError, ValueError, AttributeError):
             value = default
         return max(minimum, min(maximum, value))
@@ -154,23 +220,146 @@ class NaiPromptPlugin(Star):
         self._last_request[sender_id] = now
         return None
 
-    async def _parse_with_llm(self, event: AstrMessageEvent, description: str) -> ParsedRequest | None:
+    async def _parse_with_llm(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        system_prompt: str = LLM_SYSTEM_PROMPT,
+        retry_prompt: str = FORMAT_RETRY_PROMPT,
+    ) -> ParsedRequest | None:
+        """通过 LLM 将输入文本整理为 ParsedRequest，格式非法时按提示重试一次。
+
+        Args:
+            event: 消息事件
+            prompt: 用户输入内容（自然语言描述或图片反推标签）
+            system_prompt: LLM 系统提示词
+            retry_prompt: 首次输出不符合 schema 时的重试提示词
+
+        Returns:
+            解析结果；失败返回 None
+        """
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
             if not provider:
                 return None
-            response = await provider.text_chat(prompt=description, contexts=[], system_prompt=LLM_SYSTEM_PROMPT)
+            response = await provider.text_chat(prompt=prompt, contexts=[], system_prompt=system_prompt)
             parsed = parse_llm_response(getattr(response, "completion_text", "") if response else "")
             if parsed is not None:
                 return parsed
             logger.warning("[NAIPrompt] LLM 首次输出不符合 JSON schema，执行一次格式重试")
             retry = await provider.text_chat(
-                prompt=f"{description}\n\n{FORMAT_RETRY_PROMPT}", contexts=[], system_prompt=LLM_SYSTEM_PROMPT,
+                prompt=f"{prompt}\n\n{retry_prompt}", contexts=[], system_prompt=system_prompt,
             )
             return parse_llm_response(getattr(retry, "completion_text", "") if retry else "")
         except Exception as exc:
             logger.warning("[NAIPrompt] LLM 解析失败: %s", exc)
             return None
+
+    @staticmethod
+    def _extract_image_url(description: str) -> str | None:
+        """从命令文字中提取第一个图片 URL。
+
+        Args:
+            description: 命令文字内容
+
+        Returns:
+            匹配到的图片 URL；未找到返回 None
+        """
+        match = IMAGE_URL_PATTERN.search(description)
+        return match.group(0) if match else None
+
+    @staticmethod
+    def _strip_image_url(description: str) -> str:
+        """从描述中移除图片 URL，避免图片链接混入 LLM 输入。
+
+        Args:
+            description: 命令文字内容
+
+        Returns:
+            移除图片 URL 后的文字
+        """
+        return IMAGE_URL_PATTERN.sub("", description).strip()
+
+    async def _first_image_source(self, event: AstrMessageEvent) -> str | None:
+        """取消息附带的第一张图片的本地路径或远程 URL。
+
+        优先返回本地已存在路径（读取可靠），否则返回远程 URL。
+
+        Args:
+            event: 消息事件
+
+        Returns:
+            图片来源（路径或 URL）；无图片返回 None
+        """
+        message_obj = getattr(event, "message_obj", None)
+        images = getattr(message_obj, "image", None) or []
+        for image in images:
+            path = getattr(image, "path", None) or ""
+            url = getattr(image, "url", None) or ""
+            if isinstance(path, str) and path and os.path.exists(path):
+                return path
+            if isinstance(url, str) and url:
+                return url
+        return None
+
+    async def _download_image(self, source: str, max_bytes: int) -> tuple[bytes | None, str | None]:
+        """读取或下载图片字节。
+
+        Args:
+            source: 本地文件路径或 http(s) URL
+            max_bytes: 允许的最大字节数，超限返回错误
+
+        Returns:
+            (图片字节, 错误信息)；成功时错误信息为 None
+        """
+        if os.path.exists(source):
+            try:
+                if os.path.getsize(source) > max_bytes:
+                    return None, "图片过大，请压缩后重试。"
+                with open(source, "rb") as handle:
+                    return handle.read(), None
+            except OSError:
+                return None, "图片读取失败，请重试。"
+        timeout = aiohttp.ClientTimeout(total=self._cfg_int("tagger_timeout_seconds", 30, 5, 60))
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(source) as response:
+                    if response.status != 200:
+                        return None, "图片下载失败，请检查链接是否有效。"
+                    body = await response.read()
+                    if len(body) > max_bytes:
+                        return None, "图片过大，请压缩后重试。"
+                    return body, None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None, "图片下载失败，请稍后重试。"
+
+    async def _parse_image_flow(
+        self, event: AstrMessageEvent, source: str, description: str
+    ) -> tuple[ParsedRequest | None, str | None]:
+        """图片反推完整流程：下载图片 → Tagger 反推 → LLM 整理。
+
+        Args:
+            event: 消息事件
+            source: 图片来源（本地路径或 URL）
+            description: 去除图片 URL 后的用户描述（可为空）
+
+        Returns:
+            (解析结果, 错误信息)；成功时错误信息为 None
+        """
+        max_bytes = self._cfg_int("max_image_bytes", 10 * 1024 * 1024, 1024 * 1024, 50 * 1024 * 1024)
+        image_bytes, error = await self._download_image(source, max_bytes)
+        if error:
+            return None, error
+        if self.tagger is None:
+            return None, "图像反推服务未初始化，请稍后重试。"
+        tags = await self.tagger.tag_image(image_bytes or b"")
+        if not tags:
+            return None, "图片识别失败，请检查图片清晰度后重试。"
+        prompt = f"标签: {', '.join(tags)}\n描述: {description or '（无）'}"
+        parsed = await self._parse_with_llm(event, prompt, system_prompt=TAGGER_ORGANIZE_SYSTEM_PROMPT)
+        if parsed is None:
+            return None, "提示词整理失败，请稍后重试。"
+        return parsed, None
 
     async def _lookup_characters(self, parsed: ParsedRequest):
         if self.lookup is None:
@@ -226,12 +415,14 @@ class NaiPromptPlugin(Star):
 
     @filter.command("提示词")
     async def prompt_command(self, event: AstrMessageEvent, description: str = ""):
-        """/提示词 <自然语言描述>：生成可复制的 NAI 正负面提示词。"""
+        """/提示词 <自然语言描述>：生成可复制的 NAI 正负面提示词；附带图片时反推图片并整理提示词。"""
         description = str(description or "").strip()
-        if not description:
+        clean_description = self._strip_image_url(description)
+        image_source = await self._first_image_source(event) or self._extract_image_url(description)
+        if not clean_description and not image_source:
             yield event.plain_result(HELP_TEXT)
             return
-        if len(description) > MAX_DESCRIPTION_LENGTH:
+        if len(clean_description) > MAX_DESCRIPTION_LENGTH:
             yield event.plain_result("描述过长，请精简至 500 字以内。")
             return
         if not self._allowed(event):
@@ -242,10 +433,16 @@ class NaiPromptPlugin(Star):
             yield event.plain_result(throttled)
             return
 
-        parsed = await self._parse_with_llm(event, description)
-        if parsed is None:
-            yield event.plain_result("提示词解析失败，请稍后重试。")
-            return
+        if image_source:
+            parsed, error = await self._parse_image_flow(event, image_source, clean_description)
+            if error:
+                yield event.plain_result(error)
+                return
+        else:
+            parsed = await self._parse_with_llm(event, clean_description)
+            if parsed is None:
+                yield event.plain_result("提示词解析失败，请稍后重试。")
+                return
         characters = await self._lookup_characters(parsed)
         characters = await self._filter_conflicting_tags(event, parsed, characters)
         result = build_prompt(
