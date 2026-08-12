@@ -402,7 +402,9 @@ class NaiPromptPlugin(Star):
             return None, "图像反推服务未初始化，请稍后重试。"
         tags = await self.tagger.tag_image(image_bytes or b"")
         if not tags:
-            return None, "图片识别失败，请检查图片清晰度后重试。"
+            reason = getattr(self.tagger, "_last_error", "") or ""
+            suffix = f"（{reason}）" if reason else ""
+            return None, f"图片识别失败{suffix}，请检查图片清晰度后重试。"
         prompt = f"标签: {', '.join(tags)}\n描述: {description or '（无）'}"
         parsed = await self._parse_with_llm(event, prompt, system_prompt=TAGGER_ORGANIZE_SYSTEM_PROMPT)
         if parsed is None:

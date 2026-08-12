@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -12,12 +13,16 @@ from typing import Any
 
 import aiohttp
 
+logger = logging.getLogger("astrbot_plugin_nai_prompt.prompt_engine")
+
 DANBOORU_SEARCH_API_DEFAULT = "https://sakizuki-danboorusearch.hf.space/api"
 CHARACTER_SCORE_THRESHOLD = 0.55
 RELATED_TAG_LIMIT = 12
 
 TAGGER_API_DEFAULT = "https://smilingwolf-wd-tagger.hf.space"
 TAGGER_MODEL = "SmilingWolf/wd-swinv2-tagger-v3"
+# 角色标签阈值默认值，贴合官方 Space UI 默认（general 0.35 / character 0.85）
+TAGGER_CHARACTER_THRESHOLD = 0.85
 
 POSITIVE_BASE = ["masterpiece", "best quality"]
 NEGATIVE_BASE = [
@@ -266,6 +271,8 @@ class ImageTaggerClient:
         self.api_url = (api_url or TAGGER_API_DEFAULT).rstrip("/")
         self.timeout_seconds = max(5, min(60, int(timeout_seconds)))
         self.confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
+        # 最近一次失败原因，供上层在报错时展示以辅助排查
+        self._last_error = ""
 
     @staticmethod
     def _data_uri(image_bytes: bytes) -> str:
@@ -286,45 +293,154 @@ class ImageTaggerClient:
             mime = "image/webp"
         return f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 
-    def _payload(self, data_uri: str) -> dict[str, Any]:
+    def _payload(self, image_path: str) -> dict[str, Any]:
         """构建 Gradio 新协议命名参数请求体（图片 + 模型 + 双阈值）。
 
         Args:
-            data_uri: 图片 data URI
+            image_path: 图片在服务器端的路径（经 /gradio_api/upload 上传后返回），
+                或 data URI（镜像不支持上传时的回退）
 
         Returns:
             命名参数字典，image 为 gradio.FileData 对象，模型与阈值使用配置值
         """
         threshold = self.confidence_threshold
         return {
-            "image": {"path": data_uri, "meta": {"_type": "gradio.FileData"}},
+            "image": {"path": image_path, "meta": {"_type": "gradio.FileData"}},
             "model_repo": TAGGER_MODEL,
             "general_thresh": threshold,
             "general_mcut_enabled": False,
-            "character_thresh": threshold,
+            "character_thresh": TAGGER_CHARACTER_THRESHOLD,
             "character_mcut_enabled": False,
         }
 
+    async def _upload_image(self, session: aiohttp.ClientSession, image_bytes: bytes) -> str:
+        """按 Gradio 6 标准流程将图片 multipart 上传到 /gradio_api/upload，返回服务器端路径。
+
+        Args:
+            session: 共享 aiohttp 会话
+            image_bytes: 图片原始字节
+
+        Returns:
+            服务器端文件路径；失败返回空串并在 self._last_error 记录原因
+        """
+        url = f"{self.api_url}/gradio_api/upload"
+        form = aiohttp.FormData()
+        form.add_field("files", image_bytes, filename="image.png", content_type="application/octet-stream")
+        try:
+            async with session.post(url, data=form) as response:
+                if response.status != 200:
+                    self._last_error = f"上传 HTTP {response.status}（{url}）"
+                    logger.error("[Tagger] %s", self._last_error)
+                    return ""
+                paths = await response.json(content_type=None)
+            if isinstance(paths, list) and paths and isinstance(paths[0], str):
+                return paths[0]
+            self._last_error = f"上传响应异常: {str(paths)[:200]}（{url}）"
+            logger.error("[Tagger] %s", self._last_error)
+            return ""
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            self._last_error = f"上传异常: {type(exc).__name__}: {exc}（{url}）"
+            logger.error("[Tagger] %s", self._last_error)
+            return ""
+
     @staticmethod
     def _parse_sse_data(text: str) -> Any:
-        """从 Gradio 4.x SSE 响应文本中提取最后一个 data 负载。
+        """从 Gradio 4.x/6.x SSE 响应文本中提取结果负载。
+
+        优先取 `event: complete` 事件对应的 data（openapi 确认最终事件即 complete）；
+        无事件标记时退化为最后一个 data 行；整体非 SSE 时尝试按裸 JSON 解析（部分镜像直接返回）。
 
         Args:
             text: SSE 流响应文本
 
         Returns:
-            JSON 解析后的最后一个 data 值；无有效负载返回 None
+            JSON 解析后的结果负载；无有效负载返回 None
         """
-        result: Any = None
+        complete_payload: Any = None
+        fallback: Any = None
+        current_event = ""
         for line in text.splitlines():
             line = line.strip()
+            if line.startswith("event:"):
+                current_event = line[len("event:"):].strip()
+                continue
             if not line.startswith("data:"):
                 continue
             try:
-                result = json.loads(line[len("data:"):].strip())
+                value = json.loads(line[len("data:"):].strip())
             except json.JSONDecodeError:
                 continue
-        return result
+            if current_event == "complete":
+                complete_payload = value
+            fallback = value
+        if complete_payload is not None:
+            return complete_payload
+        if fallback is not None:
+            return fallback
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _scan_complete_data(text: str) -> Any:
+        """从累积的 SSE 文本中查找完整出现的 event: complete 事件，返回其 data。
+
+        供流式读取增量调用：数据未收完整时返回 None，追加后再调用即可。
+        半行（chunk 边界切割）因 JSON 解析失败或关键字不完整会被安全忽略。
+
+        Args:
+            text: 已累积的 SSE 文本
+
+        Returns:
+            complete 事件的 data；尚未出现完整 complete 事件返回 None
+        """
+        current_event = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("event:"):
+                current_event = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                try:
+                    value = json.loads(line[len("data:"):].strip())
+                except json.JSONDecodeError:
+                    continue
+                if current_event == "complete":
+                    return value
+        return None
+
+    async def _fetch_sse(self, session: aiohttp.ClientSession, url: str) -> tuple[Any, str]:
+        """流式拉取 Gradio SSE，收到 event: complete 即返回其 data，不等待流结束。
+
+        Args:
+            session: 共享 aiohttp 会话
+            url: SSE 拉取 URL
+
+        Returns:
+            (data, error)：data 为 complete 事件的 JSON；失败时 data 为 None 并附错误说明
+        """
+        # SSE 拉取单独放宽总超时：模型加载/推理可能超过默认超时，等待 complete 后立即返回
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds + 60)
+        buffer = ""
+        try:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status != 200:
+                    return None, f"SSE 拉取 HTTP {response.status}（{url}）"
+                async for chunk in response.content.iter_any():
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    value = self._scan_complete_data(buffer)
+                    if value is not None:
+                        return value, ""
+            # 流被服务端关闭后兜底解析
+            value = self._scan_complete_data(buffer)
+            if value is not None:
+                return value, ""
+            value = self._parse_sse_data(buffer)
+            if value is not None:
+                return value, ""
+            return None, f"SSE 流结束但未收到有效数据（{url}）"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            return None, f"SSE 拉取异常: {type(exc).__name__}: {exc}（{url}）"
 
     @staticmethod
     def _extract_tags(data: Any) -> list[str]:
@@ -355,6 +471,9 @@ class ImageTaggerClient:
 
         if not isinstance(data, list) or not data:
             return []
+        # 兼容部分版本把 outputs 再包一层：data = [[标签串, LabelData, ...]]，展平后再处理
+        if len(data) == 1 and isinstance(data[0], list) and data[0] and isinstance(data[0][0], str):
+            data = data[0]
         if isinstance(data[0], str):
             for part in data[0].split(","):
                 append_tag(part)
@@ -376,6 +495,8 @@ class ImageTaggerClient:
     async def _predict_v4(self, session: aiohttp.ClientSession, payload: dict[str, Any]) -> list[str] | None:
         """走 Gradio 新协议两步流程：POST 提交拿 event_id，GET 拉取 SSE 结果。
 
+        失败时在 self._last_error 记录具体原因，并输出日志便于排查。
+
         Args:
             session: 共享 aiohttp 会话
             payload: 命名参数请求体
@@ -383,27 +504,42 @@ class ImageTaggerClient:
         Returns:
             标签列表；失败返回 None
         """
+        submit_url = f"{self.api_url}/gradio_api/call/v2/predict"
         try:
-            async with session.post(f"{self.api_url}/gradio_api/call/v2/predict", json=payload) as response:
+            async with session.post(submit_url, json=payload) as response:
                 if response.status != 200:
+                    self._last_error = f"提交请求 HTTP {response.status}（{submit_url}）"
+                    logger.error("[Tagger] %s", self._last_error)
                     return None
                 body = await response.json(content_type=None)
             event_id = body.get("event_id") if isinstance(body, dict) else None
             if not event_id:
+                self._last_error = f"提交响应缺少 event_id：{str(body)[:200]}"
+                logger.error("[Tagger] %s", self._last_error)
                 return None
-            # SSE 拉取 URL 通常与提交 URL 同前缀；部分镜像仅暴露非 v2 前缀，逐一尝试
-            for prefix in (f"{self.api_url}/gradio_api/call/v2/predict", f"{self.api_url}/gradio_api/call/predict"):
-                async with session.get(f"{prefix}/{event_id}") as response:
-                    if response.status != 200:
-                        continue
-                    text = await response.text()
-                    return self._extract_tags(self._parse_sse_data(text))
+            # 标准 SSE 端点为 /gradio_api/call/predict/{event_id}（openapi 确认）；
+            # v2 前缀在部分镜像也有效，作为兼容候选。解析为空时继续尝试下一个前缀。
+            for prefix in (f"{self.api_url}/gradio_api/call/predict", f"{self.api_url}/gradio_api/call/v2/predict"):
+                data, err = await self._fetch_sse(session, f"{prefix}/{event_id}")
+                if data is None:
+                    self._last_error = err
+                    logger.error("[Tagger] %s", self._last_error)
+                    continue
+                tags = self._extract_tags(data)
+                if tags:
+                    return tags
+                self._last_error = f"SSE 结果为空（{prefix}/{event_id}）"
+                logger.error("[Tagger] %s，SSE data: %s", self._last_error, str(data)[:300])
             return None
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            self._last_error = f"请求异常: {type(exc).__name__}: {exc}"
+            logger.error("[Tagger] %s（%s）", self._last_error, submit_url)
             return None
 
     async def _predict_v3(self, session: aiohttp.ClientSession, payload: dict[str, Any]) -> list[str] | None:
         """走 Gradio 3.x 单次流程：POST /api/predict 直接返回 JSON。
+
+        失败时在 self._last_error 记录具体原因，并输出日志便于排查。
 
         Args:
             session: 共享 aiohttp 会话
@@ -415,18 +551,27 @@ class ImageTaggerClient:
         try:
             async with session.post(f"{self.api_url}/api/predict", json=payload) as response:
                 if response.status != 200:
+                    self._last_error = f"v3 提交 HTTP {response.status}（{self.api_url}/api/predict）"
+                    logger.error("[Tagger] %s", self._last_error)
                     return None
                 body = await response.json(content_type=None)
             data = body.get("data") if isinstance(body, dict) else body
-            return self._extract_tags(data)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            tags = self._extract_tags(data)
+            if not tags:
+                self._last_error = "v3 响应 data 为空"
+                logger.error("[Tagger] %s，响应: %s", self._last_error, str(body)[:300])
+            return tags
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            self._last_error = f"v3 请求异常: {type(exc).__name__}: {exc}"
+            logger.error("[Tagger] %s", self._last_error)
             return None
 
     async def tag_image(self, image_bytes: bytes) -> list[str]:
         """将图片字节反推为 Danbooru 标签列表。
 
-        优先尝试 Gradio 新协议（两步流程），失败后回退 3.x；响应为空时用最小请求体重试一次
-        （部分简化镜像只暴露图片一个入参）。全部失败返回空列表。
+        按 Gradio 6 标准流程先上传图片拿到服务器路径，再走新协议两步流程；
+        上传失败时回退为内联 base64 data URI；响应为空时用最小请求体重试一次。
+        全部失败返回空列表。
 
         Args:
             image_bytes: 图片原始字节
@@ -434,19 +579,32 @@ class ImageTaggerClient:
         Returns:
             反推得到的标签列表，可能为空
         """
-        data_uri = self._data_uri(image_bytes)
-        payload = self._payload(data_uri)
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         headers = {"User-Agent": "AstrBot-NAIPrompt/1.0"}
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            image_path = await self._upload_image(session, image_bytes)
+            if not image_path:
+                # 上传失败（无鉴权/镜像不支持），回退为直接内联 base64 data URI
+                image_path = self._data_uri(image_bytes)
+            payload = self._payload(image_path)
             tags = await self._predict_v4(session, payload)
             if tags is None:
+                # v4 为正确协议，其失败原因优先保留；v3 大多因 Space 不支持而 404/405，仅作兜底
+                v4_error = self._last_error or ""
                 tags = await self._predict_v3(session, payload)
+                if not tags:
+                    self._last_error = v4_error or self._last_error or ""
             if not tags:
-                minimal = {"image": {"path": data_uri, "meta": {"_type": "gradio.FileData"}}}
+                minimal = {"image": {"path": image_path, "meta": {"_type": "gradio.FileData"}}}
+                v4_error = self._last_error or ""
                 tags = await self._predict_v4(session, minimal)
                 if tags is None:
+                    minimal_v4_error = self._last_error or ""
                     tags = await self._predict_v3(session, minimal)
+                    if not tags:
+                        self._last_error = minimal_v4_error or v4_error or self._last_error or ""
+        if not tags:
+            logger.error("[Tagger] 图片反推最终失败，原因: %s", self._last_error or "未知")
         return tags or []
 
 
