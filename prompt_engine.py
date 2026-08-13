@@ -24,11 +24,19 @@ TAGGER_MODEL = "SmilingWolf/wd-swinv2-tagger-v3"
 # 角色标签阈值默认值，贴合官方 Space UI 默认（general 0.35 / character 0.85）
 TAGGER_CHARACTER_THRESHOLD = 0.85
 
-POSITIVE_BASE = ["masterpiece", "best quality"]
-NEGATIVE_BASE = [
-    "bad_hands", "extra_fingers", "deformed_hands", "lowres", "worst_quality",
-    "bad_anatomy", "blurry", "distorted", "ugly",
-]
+DEDUP_SYSTEM_PROMPT = """你是 NAI 标签去重器。只返回一个合法 JSON 对象，不要 Markdown、解释或额外文字。
+输入是一组英文小写 NAI/Danbooru 标签，可能含权重语法（如 1.2::tag::）。
+
+JSON schema:
+{
+  "deduped_tags": ["去重后的标签列表"]
+}
+
+规则：
+- 合并语义相同的同义词，每个概念只保留一个最准确、最贴合输入的标签。
+- 保持原有顺序，不要重排；保留权重语法。
+- 不要新增输入中没有的标签，不要丢弃有实质语义差异的标签。
+- 输出必须为合法 JSON。"""
 
 # These apply only to API-returned related tags, never to user/LLM tags.
 RELATED_DROP_EXACT = {
@@ -608,24 +616,91 @@ class ImageTaggerClient:
         return tags or []
 
 
-def build_prompt(parsed: ParsedRequest, lookup_results: list[CharacterTags], allow_adult: bool, max_length: int) -> PromptResult:
-    level = resolve_nsfw_level(parsed, allow_adult)
-    resolved_tags = _unique([tag for result in lookup_results for tag in result.tags])
-    user_character_tags = [tag for character in parsed.characters for tag in character.tags]
-    all_tags = _unique(
-        POSITIVE_BASE + parsed.shared_tags + resolved_tags + user_character_tags + parsed.outfit_tags
-        + parsed.action_tags + parsed.scene_tags + parsed.style_tags + nsfw_tags(level)
-    )
+async def _dedupe_tags_semantic(provider: Any, tags: list[str]) -> list[str]:
+    """通过 LLM 对标签做语义去重，合并同义词并保持原顺序与权重语法。
+
+    Args:
+        provider: LLM provider，需支持 text_chat(prompt, contexts, system_prompt)
+        tags: 待去重的标签列表
+
+    Returns:
+        语义去重后的标签列表；LLM 失败或无有效输出时返回原列表（降级不去重）
+    """
+    if not tags or provider is None:
+        return tags
+    try:
+        response = await provider.text_chat(
+            prompt=", ".join(tags),
+            contexts=[],
+            system_prompt=DEDUP_SYSTEM_PROMPT,
+        )
+        text = getattr(response, "completion_text", "") if response else ""
+        data = extract_json(text)
+        if data and isinstance(data.get("deduped_tags"), list):
+            deduped = _as_tag_list(data["deduped_tags"], len(tags) + 16, allow_weights=True)
+            if deduped:
+                return deduped
+    except Exception as exc:
+        logger.warning("[NAIPrompt] LLM 语义去重失败，降级不去重: %s", exc)
+    return tags
+
+
+def _truncate_tags(tags: list[str], max_length: int) -> list[str]:
+    """按字符上限截断标签列表；max_length <= 0 表示不截断。
+
+    Args:
+        tags: 标签列表
+        max_length: 最大字符数，非正数时不截断
+
+    Returns:
+        截断后的标签列表
+    """
+    if max_length <= 0:
+        return tags
     max_length = max(200, min(5000, int(max_length)))
     selected: list[str] = []
-    for tag in all_tags:
+    for tag in tags:
         if len(", ".join(selected + [tag])) > max_length:
             break
         selected.append(tag)
+    return selected
+
+
+async def build_prompt(
+    parsed: ParsedRequest,
+    lookup_results: list[CharacterTags],
+    allow_adult: bool,
+    max_length: int,
+    provider: Any = None,
+) -> PromptResult:
+    """组装最终正负面提示词。
+
+    标签顺序：人数/共享 → 角色 → 用户专属外观 → 服装 → 动作 → 场景 → 风格 → NSFW；
+    最终列表交由 LLM 做语义去重（失败降级不去重），并按 max_length 截断（0 不截断）。
+
+    Args:
+        parsed: LLM 解析结果
+        lookup_results: DanbooruSearch 角色查询结果列表
+        allow_adult: 是否允许成人向
+        max_length: 正面提示词最大字符数，0 表示不截断
+        provider: LLM provider，用于语义去重；None 时跳过语义去重
+
+    Returns:
+        组装后的 PromptResult
+    """
+    level = resolve_nsfw_level(parsed, allow_adult)
+    resolved_tags = _unique([tag for result in lookup_results for tag in result.tags])
+    user_character_tags = [tag for character in parsed.characters for tag in character.tags]
+    merged_tags = (
+        parsed.shared_tags + resolved_tags + user_character_tags + parsed.outfit_tags
+        + parsed.action_tags + parsed.scene_tags + parsed.style_tags + nsfw_tags(level)
+    )
+    all_tags = await _dedupe_tags_semantic(provider, merged_tags)
+    selected = _truncate_tags(all_tags, max_length)
     source = "DanbooruSearch 角色标签" if lookup_results else "LLM 转译"
     return PromptResult(
         positive=", ".join(selected),
-        negative=", ".join(NEGATIVE_BASE),
+        negative="",
         character_tags=resolved_tags,
         source=source,
         nsfw_level={"safe": "全年龄", "suggestive": "擦边", "explicit": "成人向"}[level],
@@ -634,13 +709,17 @@ def build_prompt(parsed: ParsedRequest, lookup_results: list[CharacterTags], all
 
 
 def format_result(result: PromptResult) -> str:
-    char_tags = ", ".join(result.character_tags) if result.character_tags else "未识别到可验证角色标签"
-    lines = [
-        "┌─ NAI 提示词生成 ─────────", f"│ 标签来源：{result.source}", f"│ NSFW 等级：{result.nsfw_level}",
-        "├─ 角色标签", f"│ {char_tags}", "├─ 正面 Prompt", "```text", result.positive, "```",
-        "├─ 负面 Prompt", "```text", result.negative, "```",
-    ]
+    """将 PromptResult 格式化为极简纯文本：正面提示词 + 一行元信息注释。
+
+    Args:
+        result: 组装结果
+
+    Returns:
+        正面提示词纯文本，末尾附带来源、NSFW、角色标签与多角色建议的一行注释
+    """
+    meta = [f"来源:{result.source}", f"NSFW:{result.nsfw_level}"]
+    if result.character_tags:
+        meta.append(f"角色:{', '.join(result.character_tags)}")
     if result.multi_character_note:
-        lines.extend(["├─ NAI V4 多角色建议", "│ 将每位角色专属标签分别填入 Character Prompting；动作、互动和场景保留在主 Prompt。"])
-    lines.append("└────────────────────────")
-    return "\n".join(lines)
+        meta.append("多角色:将各角色专属标签分别填入 Character Prompting")
+    return f"{result.positive}\n（{' | '.join(meta)}）"

@@ -65,7 +65,7 @@ JSON schema:
 - danbooru_tag 必须留空字符串，插件会使用 DanbooruSearch 查询 canonical 角色标签。
 - 普通标签必须英文小写下划线；不要写完整句子。
 - 不得添加用户未明确描述的服装、道具、天气、光照、时间或外观。
-- 不得输出 masterpiece、best_quality、画师标签、负面词、尺寸或比例词；插件会统一处理。
+- 不得输出 masterpiece、best_quality、画师标签、负面词、尺寸或比例词。
 - 不要堆叠同义词；每个概念只保留一个最准确标签。
 - 未提及的数组必须返回空数组。"""
 
@@ -495,10 +495,12 @@ class NaiPromptPlugin(Star):
                 return
         characters = await self._lookup_characters(parsed)
         characters = await self._filter_conflicting_tags(event, parsed, characters)
-        result = build_prompt(
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        result = await build_prompt(
             parsed=parsed,
             lookup_results=characters,
             allow_adult=self._cfg_bool("allow_adult_prompts", True),
-            max_length=self._cfg_int("max_prompt_length", 1800, 200, 5000),
+            max_length=self._cfg_int("max_prompt_length", 0, 0, 5000),
+            provider=provider,
         )
         yield event.plain_result(format_result(result))

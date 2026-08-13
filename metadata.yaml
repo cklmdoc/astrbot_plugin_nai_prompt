@@ -1,8 +1,8 @@
 name: astrbot_plugin_nai_prompt
 display_name: NAI 提示词助手
-version: v1.0.0
+version: v1.1.0
 author: cklmdoc
-desc: 将自然语言或图片转换为可复制的 NAI 生图正面与负面提示词，支持图片反推、角色标签查询、权限白名单和安全降级。
+desc: 将自然语言或图片转换为可复制的 NAI 生图提示词，支持图片反推、角色标签查询、语义去重、权限白名单和安全降级。
 repo: ""
 astrbot_version: ">=4.16"
 support_platforms:

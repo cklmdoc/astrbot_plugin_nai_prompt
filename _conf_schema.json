@@ -28,8 +28,8 @@
   },
   "max_prompt_length": {
     "type": "int",
-    "description": "最终正面 Prompt 最大字符数。",
-    "default": 1800
+    "description": "最终正面 Prompt 最大字符数；设为 0 不截断。",
+    "default": 0
   },
   "tagger_api_url": {
     "type": "string",

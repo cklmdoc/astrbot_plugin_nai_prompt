@@ -1,6 +1,6 @@
 # NAI 提示词助手
 
-AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI 正面 / 负面提示词。
+AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI 正面提示词。
 
 ## 安装
 
@@ -19,10 +19,12 @@ AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI �
 
 图片输入时：命令后附带图片，或在文字中附图片链接即可。插件先经 WD14 Tagger 反推标签，再由 LLM 整理后进入同一流程。
 
-流程：当前会话 LLM 按 JSON 规则转译（图片为 Tagger 标签整理）→ DanbooruSearch 语义搜索角色 → 关联 General 特征增强 → 最终 Prompt 组装。
+流程：当前会话 LLM 按 JSON 规则转译（图片为 Tagger 标签整理）→ DanbooruSearch 语义搜索角色 → 关联 General 特征增强 → LLM 语义去重 → 最终 Prompt 组装。
 
 DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若不可用或角色匹配分数不足，插件仍输出 LLM 转译结果。
 
 图反推默认 API：`https://smilingwolf-wd-tagger.hf.space`（Gradio 新协议/3.x 协议均可），可在配置中替换为自建镜像。
 
-成人向仅在 LLM 标记角色为 `adult` 且 `allow_adult_prompts=true` 时启用；其它情况均生成全年龄版本。
+输出为极简纯文本：正面提示词 + 一行元信息注释（来源 / NSFW / 角色 / 多角色建议）。默认不截断（`max_prompt_length` 设为 0），可按需配置上限。
+
+成人向仅在 `allow_adult_prompts=true` 且解析出 `explicit` 等级时启用；其它情况均生成全年龄版本。
