@@ -322,6 +322,39 @@ def subject_gender(shared_tags: list[str]) -> str:
     return ""
 
 
+def looks_like_prompt(text: str) -> bool:
+    """判断文本是否像本插件生成的 NAI 提示词。
+
+    按逗号/竖线切分 token，统计符合标签语法的有效 token 数量与占比，
+    双阈值（数量 ≥ 3 且占比 ≥ 60%）判定，避免关键词误判。
+
+    Args:
+        text: 待判断文本
+
+    Returns:
+        像提示词返回 True，否则 False
+    """
+    if not text:
+        return False
+    tokens = [t.strip() for t in re.split(r"[,|]", text)]
+    tokens = [t for t in tokens if t]
+    if len(tokens) < 3:
+        return False
+    tag_pattern = re.compile(r"[a-z0-9_()#\-]+")
+    weight_pattern = re.compile(r"\d+(?:\.\d+)?::[a-z0-9_()#,\-]+::")
+    valid = 0
+    for token in tokens:
+        lowered = token.lower()
+        # 渲染文字 Text: 内容 视为有效
+        if lowered.startswith("text:"):
+            valid += 1
+            continue
+        tag = lowered.replace(" ", "_")
+        if tag_pattern.fullmatch(tag) or weight_pattern.fullmatch(tag):
+            valid += 1
+    return valid >= 3 and valid >= len(tokens) * 0.6
+
+
 def nsfw_tags(level: str) -> list[str]:
     if level == "suggestive":
         return ["underwear", "ecchi", "no_nudity", "no_nipples", "no_pussy"]

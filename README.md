@@ -43,6 +43,17 @@ DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若
 - 互动：`source#动作` / `target#动作` / `mutual#动作`。
 - 文字与情绪：`Text: 内容` / `no text`，可加入情绪词增强表现力。
 
+## 增量修改
+
+引用（QQ 回复）机器人上一条提示词消息，再发 `/提示词 修改指令` 即可基于原提示词增量迭代：
+
+```text
+/提示词 把红色长发改成蓝色短发   # 引用提示词后修改
+/提示词 去掉背景，加上夕阳       # 引用提示词后增删标签
+```
+
+插件会校验被引用消息发送者为机器人自己且内容含提示词特征，再由 LLM 直接输出修改后的完整提示词；可复用 `enable_image_generation` 联动示例图。
+
 ## 示例图生成
 
 开启 `enable_image_generation`（默认 `false`）后，插件会在返回提示词后调用本地生图服务生成示例图，并按 `image_count`（默认 1）回传指定张数。

@@ -29,6 +29,7 @@ from .prompt_engine import (
     build_prompt,
     extract_json,
     format_result,
+    looks_like_prompt,
     parse_llm_response,
     resolve_nsfw_level,
 )
@@ -148,6 +149,19 @@ JSON schema:
   - 用户描述中有强调/弱化意图时，同样按 strong/very_strong/weak 填入 weights。
   - tag 必须是上述数组中已存在的、完全一致的英文小写普通标签（不含权重语法）。
   - 无需要时 weights 返回空数组。"""
+
+INCREMENTAL_EDIT_SYSTEM_PROMPT = """你是 NAI 提示词增量编辑器。根据用户的修改指令，修改给定的 NAI 提示词。只输出修改后的完整提示词文本，不要 Markdown、解释或额外文字。
+
+输入格式：
+原提示词: <完整 NAI 提示词>
+修改指令: <用户的修改要求>
+
+规则：
+- 只修改用户指令涉及的部分，保留其余标签、权重语法（权重::标签::）、| 分隔结构与互动标签不变。
+- 修改后输出完整的提示词（不要只输出改动部分）。
+- 保持英文小写标签与原有格式。
+- 用户要求去掉某标签时直接删除；要求修改时替换；要求新增时补到合适位置。
+- 不要添加用户未要求的标签。"""
 
 
 class NaiPromptPlugin(Star):
@@ -562,11 +576,86 @@ class NaiPromptPlugin(Star):
             if path:
                 yield event.image_result(path)
 
+    async def _reply_prompt_source(self, event: AstrMessageEvent) -> str | None:
+        """从消息链中提取被引用回复的提示词文本（仅当引用的是机器人自己的提示词）。
+
+        Args:
+            event: 消息事件
+
+        Returns:
+            被引用的提示词文本；无有效引用返回 None
+        """
+        try:
+            self_id = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+        except Exception:
+            self_id = ""
+        for component in self._message_components(event):
+            if component.__class__.__name__.lower() != "reply":
+                continue
+            sender_id = str(getattr(component, "sender_id", "") or "")
+            message_str = getattr(component, "message_str", "") or getattr(component, "text", "") or ""
+            if self_id and sender_id and sender_id != self_id:
+                continue
+            if not message_str or not looks_like_prompt(str(message_str)):
+                continue
+            return str(message_str)
+        return None
+
+    async def _edit_prompt(self, event: AstrMessageEvent, quoted_prompt: str, instruction: str):
+        """基于被引用提示词与修改指令，通过 LLM 输出修改后的提示词并联动示例图。
+
+        Args:
+            event: 消息事件
+            quoted_prompt: 被引用的原提示词
+            instruction: 修改指令
+
+        Yields:
+            修改后的提示词结果（及可选的示例图）
+        """
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            yield event.plain_result("当前无可用的 LLM 服务，无法进行增量修改。")
+            return
+        prompt = f"原提示词: {quoted_prompt}\n修改指令: {instruction}"
+        try:
+            response = await provider.text_chat(prompt=prompt, contexts=[], system_prompt=INCREMENTAL_EDIT_SYSTEM_PROMPT)
+            text = getattr(response, "completion_text", "") if response else ""
+        except Exception as exc:
+            logger.warning("[NAIPrompt] 增量修改失败: %s", exc)
+            text = ""
+        text = (text or "").strip()
+        # 去除可能的 Markdown 代码块包裹
+        if text.startswith("```"):
+            text = text.strip("`").strip()
+        if not text:
+            yield event.plain_result("增量修改失败，请稍后重试。")
+            return
+        yield event.plain_result(text)
+        if self._cfg_bool("enable_image_generation", False):
+            async for image_result in self._generate_images(event, text):
+                yield image_result
+
     @filter.command("提示词")
     async def prompt_command(self, event: AstrMessageEvent, description: str = ""):
         """/提示词 <自然语言描述>：生成可复制的 NAI 正负面提示词；附带图片时反推图片并整理提示词。"""
         description = str(description or "").strip()
         clean_description = self._strip_image_url(description)
+        # 增量修改：检测到引用机器人提示词且带修改指令时，进入修改模式
+        quoted_prompt = await self._reply_prompt_source(event)
+        if quoted_prompt and clean_description:
+            if len(clean_description) > MAX_DESCRIPTION_LENGTH:
+                yield event.plain_result("描述过长，请精简至 500 字以内。")
+                return
+            if not self._allowed(event):
+                yield event.plain_result("当前用户未获提示词功能授权，请联系管理员。")
+                return
+            throttled = self._cooldown_message(self._sender_id(event))
+            if throttled:
+                yield event.plain_result(throttled)
+                return
+            async for item in self._edit_prompt(event, quoted_prompt, clean_description):
+                yield item
+            return
         image_source = await self._first_image_source(event) or self._extract_image_url(description)
         if not clean_description and not image_source:
             yield event.plain_result(HELP_TEXT)
