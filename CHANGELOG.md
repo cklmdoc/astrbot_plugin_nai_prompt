@@ -6,7 +6,7 @@
 
 ### 新增
 - 切换到 NAI 新版格式：角色用 `人物名(作品名)` 引用（DanbooruSearch 组合 Character canonical + Copyright 作品名）。
-- 多角色 Character Prompting：`{人物 [tags], {位置} 人物}` 包裹 + `{人物 与 人物}` 连接，最多 6 人，位置由 LLM 判断。
+- 多角色 Character Prompting：用 `|` 分隔 base prompt 与各角色 prompt，最多 6 人，人数标签在 base、各角色用 `girl`/`boy`/`other`，位置以自然语言强化。
 - 互动标签：`source#动作` / `target#动作` / `mutual#动作`。
 - 渲染文字（`Text:` / `no text`）与情绪词支持。
 

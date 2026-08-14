@@ -55,7 +55,7 @@ JSON schema:
      "display_name": "角色名（中文或英文常用名）；原创角色填空字符串",
      "danbooru_tag": "留空字符串；角色标签与作品名由插件查询服务确定",
      "tags": ["该角色专属标签，含外貌特征；多角色互动时含互动标签"],
-     "position": "多角色时该角色位置，如 左/中/右/上/下 及其组合；未提及填空字符串"
+     "position": "多角色时该角色位置，如 left/right/center/up/down 及其组合；未提及填空字符串"
    }
  ],
  "shared_tags": ["人数和共享主体标签，如 1girl"],
@@ -119,7 +119,7 @@ JSON schema:
      "display_name": "识别出的角色名（如 hatsune_miku）；未识别到角色填空字符串",
      "danbooru_tag": "留空字符串；角色标签与作品名由插件查询服务确定",
      "tags": ["该角色专属标签，含外貌特征；多角色互动时含互动标签"],
-     "position": "多角色时该角色位置，如 左/中/右/上/下 及其组合；未提及填空字符串"
+     "position": "多角色时该角色位置，如 left/right/center/up/down 及其组合；未提及填空字符串"
    }
  ],
  "shared_tags": ["人数和共享主体标签，如 1girl"],

@@ -270,6 +270,58 @@ def format_character_name(canonical_tag: str, copyright_tag: str) -> str:
     return name
 
 
+# 位置词到自然语言的映射，用于多角色位置的自然语言强化
+_POSITION_WORDS = {
+    "left": "left",
+    "right": "right",
+    "center": "center",
+    "middle": "center",
+    "top": "top",
+    "up": "top",
+    "upper": "top",
+    "bottom": "bottom",
+    "down": "bottom",
+    "lower": "bottom",
+}
+
+
+def format_position(position: str) -> str:
+    """将角色位置值转为自然语言短语，如 left -> on the left。
+
+    Args:
+        position: 位置值（英文，可为组合，如 top left）
+
+    Returns:
+        自然语言位置短语；空串或无法识别返回空串
+    """
+    words = [w for w in position.strip().lower().split() if w]
+    if not words:
+        return ""
+    mapped = [_POSITION_WORDS.get(w) for w in words]
+    if not mapped or any(m is None for m in mapped):
+        return ""
+    phrase = " ".join(mapped)
+    if phrase == "center":
+        return "in the center"
+    return f"on the {phrase}"
+
+
+def subject_gender(shared_tags: list[str]) -> str:
+    """从共享标签中提取角色性别标签（不带数字），如 2girls -> girl。
+
+    Args:
+        shared_tags: 共享标签列表
+
+    Returns:
+        girl/boy/other；未识别返回空串
+    """
+    for tag in shared_tags:
+        match = re.fullmatch(r"\d+(girl|boy|other)s?", tag)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def nsfw_tags(level: str) -> list[str]:
     if level == "suggestive":
         return ["underwear", "ecchi", "no_nudity", "no_nipples", "no_pussy"]
@@ -807,8 +859,8 @@ async def build_prompt(
     """按 NAI 新版格式组装最终正面提示词。
 
     单角色：人物名(作品名) 与特征、服装、动作、场景、风格等平铺；
-    多角色：每个角色用 {人物 [tags], {位置} 人物} 包裹，{人物 与 人物} 连接，
-    共享标签放在包裹之外。权重统一用 权重::标签:: 语法，语义去重失败降级不去重。
+    多角色：用 | 分隔 base prompt 与各角色 prompt（官方语法），位置用自然语言强化。
+    权重统一用 权重::标签:: 语法，语义去重失败降级不去重。
 
     Args:
         parsed: LLM 解析结果
@@ -846,16 +898,22 @@ async def build_prompt(
     shared_tags = _apply_weights(shared_tags, parsed.weights)
 
     if len(char_entries) >= 2:
-        # 多角色：每个角色用 {人物 [...]} 包裹，{人物 与 人物} 连接，共享标签放外面
-        pieces: list[str] = []
-        for idx, (name, tags, position) in enumerate(char_entries):
-            if idx > 0:
-                pieces.append("{人物 与 人物}")
-            inner = ", ".join(([name] if name else []) + tags)
-            pos = f", {{位置{position}}}" if position else ""
-            pieces.append(f"{{人物 [{inner}]{pos} 人物}}")
-        shared = await _dedupe_tags_semantic(provider, shared_tags)
-        positive = ", ".join(pieces + shared)
+        # 多角色：| 分隔 base prompt 与各角色 prompt（官方语法）
+        gender = subject_gender(shared_tags)
+        base = await _dedupe_tags_semantic(provider, shared_tags)
+        char_prompts: list[str] = []
+        for name, tags, position in char_entries:
+            parts: list[str] = []
+            if gender and gender not in tags:
+                parts.append(gender)
+            if name:
+                parts.append(name)
+            parts.extend(tags)
+            pos = format_position(position)
+            if pos:
+                parts.append(pos)
+            char_prompts.append(", ".join(parts))
+        positive = " | ".join([", ".join(base)] + char_prompts)
     else:
         # 单角色或原创：平铺（角色名不参与去重/截断，始终在最前）
         if char_entries:

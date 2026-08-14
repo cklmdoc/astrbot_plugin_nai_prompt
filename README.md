@@ -39,7 +39,7 @@ DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若
 ## 新版格式
 
 - 角色：`人物名(作品名)` 引用（如 `texas the omertosa (arknights)`），由 DanbooruSearch 组合 Character canonical 与 Copyright 作品名。
-- 多角色：`{人物 [tags], {位置} 人物}` 包裹 + `{人物 与 人物}` 连接，最多 6 人，位置由 LLM 判断。
+- 多角色：用 `|` 分隔 base prompt 与各角色 prompt（`base | 角色1 | 角色2`），最多 6 人；人数标签（`2girls`）在 base，各角色用 `girl`/`boy`/`other`，位置以自然语言（如 `on the left`）强化。
 - 互动：`source#动作` / `target#动作` / `mutual#动作`。
 - 文字与情绪：`Text: 内容` / `no text`，可加入情绪词增强表现力。
 
