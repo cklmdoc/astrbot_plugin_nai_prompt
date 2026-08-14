@@ -201,8 +201,13 @@ class NaiPromptPlugin(Star):
         return False
 
     def _allowed(self, event: AstrMessageEvent) -> bool:
+        # 管理员始终放行，不受白名单开关与列表约束
         if self._is_admin(event):
             return True
+        # 白名单开关未启用时，开放给所有用户
+        if not self._cfg_bool("enable_whitelist", False):
+            return True
+        # 白名单已启用：仅白名单内用户放行；名单为空时仅管理员可用
         raw_ids = self.config.get("allowed_user_ids", []) if hasattr(self.config, "get") else []
         if isinstance(raw_ids, str):
             raw_ids = [raw_ids]

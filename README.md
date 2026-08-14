@@ -6,7 +6,7 @@ AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI �
 
 将整个 `astrbot_plugin_nai_prompt` 目录复制到 AstrBot 的 `data/plugins/`，在 WebUI 插件页加载或重载。AstrBot 会按 `requirements.txt` 安装 `aiohttp`。
 
-首次使用前，在插件配置填写 `allowed_user_ids`；为空时仅 AstrBot 管理员可用。
+默认所有用户均可使用。如需限制，将 `enable_whitelist` 设为 `true` 并在 `allowed_user_ids` 填写允许的用户 ID；开启后仅管理员及白名单内用户可用。
 
 ## 使用
 
