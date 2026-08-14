@@ -25,7 +25,7 @@ TAGGER_MODEL = "SmilingWolf/wd-swinv2-tagger-v3"
 TAGGER_CHARACTER_THRESHOLD = 0.85
 
 DEDUP_SYSTEM_PROMPT = """你是 NAI 标签去重器。只返回一个合法 JSON 对象，不要 Markdown、解释或额外文字。
-输入是一组英文小写 NAI/Danbooru 标签，可能含权重语法（如 1.2::tag::）。
+输入是一组英文小写 NAI/Danbooru 标签，可能含 NAI 权重语法（如 (tag:1.2) 强调或 [tag] 弱化）。
 
 JSON schema:
 {
@@ -56,6 +56,24 @@ class CharacterRequest:
 
 
 @dataclass
+class WeightEntry:
+    """单条权重配置：目标标签与强调等级。
+
+    属性:
+        tag: 目标英文小写普通标签（不含权重语法）
+        level: 强调等级，取值 weak/strong/very_strong
+    """
+
+    tag: str = ""
+    level: str = "strong"
+
+
+# 三档权重映射：weak 用方括号弱化，strong/very_strong 用 NAI 原生括号加权
+WEIGHT_STRONG_VALUE = 1.2
+WEIGHT_VERY_STRONG_VALUE = 1.4
+
+
+@dataclass
 class ParsedRequest:
     characters: list[CharacterRequest] = field(default_factory=list)
     shared_tags: list[str] = field(default_factory=list)
@@ -64,6 +82,7 @@ class ParsedRequest:
     scene_tags: list[str] = field(default_factory=list)
     style_tags: list[str] = field(default_factory=list)
     nsfw_level: str = "safe"
+    weights: list[WeightEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -87,7 +106,8 @@ def _as_tag_list(value: Any, limit: int = 80, allow_weights: bool = False) -> li
     if not isinstance(value, list):
         return []
     result: list[str] = []
-    tag_pattern = r"(?:[a-z0-9_()\-]+|(?:0?\.[5-9]|1(?:\.\d+)?)::[a-z0-9_()\-]+::)"
+    # 权重语法为 NAI 原生：强调 (tag:1.2)，弱化 [tag]
+    tag_pattern = r"(?:[a-z0-9_()\-]+|\([a-z0-9_()\-]+:\d+(?:\.\d+)?\)|\[[a-z0-9_()\-]+\])"
     for item in value[:limit]:
         if not isinstance(item, str):
             continue
@@ -111,6 +131,34 @@ def extract_json(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return result if isinstance(result, dict) else None
+
+
+def _parse_weights(value: Any) -> list[WeightEntry]:
+    """解析 LLM 输出的 weights 字段为 WeightEntry 列表。
+
+    Args:
+        value: LLM JSON 中的 weights 字段，应为 [{tag, level}] 列表
+
+    Returns:
+        合法的 WeightEntry 列表；非法项被静默跳过
+    """
+    if not isinstance(value, list):
+        return []
+    result: list[WeightEntry] = []
+    for item in value[:40]:
+        if not isinstance(item, dict):
+            continue
+        tag = item.get("tag")
+        level = item.get("level")
+        if not isinstance(tag, str) or not isinstance(level, str):
+            continue
+        normalized = tag.strip().lower().replace(" ", "_")
+        if not re.fullmatch(r"[a-z0-9_\-]+", normalized):
+            continue
+        if level not in {"weak", "strong", "very_strong"}:
+            continue
+        result.append(WeightEntry(tag=normalized, level=level))
+    return result
 
 
 def parse_llm_response(text: str) -> ParsedRequest | None:
@@ -140,8 +188,9 @@ def parse_llm_response(text: str) -> ParsedRequest | None:
         outfit_tags=_as_tag_list(data["outfit_tags"]),
         action_tags=_as_tag_list(data["action_tags"]),
         scene_tags=_as_tag_list(data["scene_tags"]),
-        style_tags=_as_tag_list(data["style_tags"], allow_weights=True),
+        style_tags=_as_tag_list(data["style_tags"]),
         nsfw_level=data["nsfw_level"],
+        weights=_parse_weights(data.get("weights")),
     )
 
 
@@ -149,6 +198,49 @@ def resolve_nsfw_level(parsed: ParsedRequest, allow_adult: bool) -> str:
     if not allow_adult:
         return "safe"
     return parsed.nsfw_level
+
+
+def render_weighted_tag(tag: str, level: str) -> str:
+    """将普通标签按等级渲染为 NAI 原生权重语法。
+
+    Args:
+        tag: 英文小写普通标签
+        level: 强调等级，weak/strong/very_strong
+
+    Returns:
+        weak -> [tag]，strong -> (tag:1.2)，very_strong -> (tag:1.4)；
+        其它等级原样返回
+    """
+    if level == "weak":
+        return f"[{tag}]"
+    if level == "very_strong":
+        return f"({tag}:{WEIGHT_VERY_STRONG_VALUE})"
+    if level == "strong":
+        return f"({tag}:{WEIGHT_STRONG_VALUE})"
+    return tag
+
+
+def _apply_weights(tags: list[str], weights: list[WeightEntry]) -> list[str]:
+    """按权重配置将标签渲染为 NAI 权重语法。
+
+    仅对普通标签（不含括号/权重语法）应用；权重表中不存在或非普通标签保持原样。
+
+    Args:
+        tags: 待套权重的标签列表（保持顺序）
+        weights: 权重配置列表
+
+    Returns:
+        套用权重后的标签列表
+    """
+    level_map = {entry.tag: entry.level for entry in weights}
+    result: list[str] = []
+    for tag in tags:
+        level = level_map.get(tag)
+        if level and re.fullmatch(r"[a-z0-9_\-]+", tag):
+            result.append(render_weighted_tag(tag, level))
+        else:
+            result.append(tag)
+    return result
 
 
 def nsfw_tags(level: str) -> list[str]:
@@ -676,7 +768,8 @@ async def build_prompt(
     """组装最终正负面提示词。
 
     标签顺序：人数/共享 → 角色 → 用户专属外观 → 服装 → 动作 → 场景 → 风格 → NSFW；
-    最终列表交由 LLM 做语义去重（失败降级不去重），并按 max_length 截断（0 不截断）。
+    先去除完全重复并套用权重语法，再交由 LLM 做语义去重（失败降级不去重），
+    最后按 max_length 截断（0 不截断）。
 
     Args:
         parsed: LLM 解析结果
@@ -695,7 +788,9 @@ async def build_prompt(
         parsed.shared_tags + resolved_tags + user_character_tags + parsed.outfit_tags
         + parsed.action_tags + parsed.scene_tags + parsed.style_tags + nsfw_tags(level)
     )
-    all_tags = await _dedupe_tags_semantic(provider, merged_tags)
+    merged_tags = _unique(merged_tags)
+    weighted_tags = _apply_weights(merged_tags, parsed.weights)
+    all_tags = await _dedupe_tags_semantic(provider, weighted_tags)
     selected = _truncate_tags(all_tags, max_length)
     source = "DanbooruSearch 角色标签" if lookup_results else "LLM 转译"
     return PromptResult(

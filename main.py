@@ -33,9 +33,11 @@ from .prompt_engine import (
 HELP_TEXT = """用法：/提示词 <自然语言描述>
 
 支持图片反推：命令后附带图片，或在文字中附图片链接，即可反推并整理 NAI 提示词（可附加文字微调）。
+支持强调/弱化：用"突出/强调/重点/弱化/淡化"等词控制标签权重。
 
 示例：
 /提示词 流萤穿校服，在樱花树下微笑
+/提示词 突出红色长发，弱化背景，穿校服
 /提示词 + 图片 → 反推图片中的角色与特征"""
 MAX_DESCRIPTION_LENGTH = 500
 IMAGE_URL_PATTERN = re.compile(r"https?://[^\s]+?\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s]*)?", re.IGNORECASE)
@@ -56,8 +58,11 @@ JSON schema:
  "outfit_tags": ["用户明确指定的服装"],
  "action_tags": ["动作和互动"],
  "scene_tags": ["场景、道具、明确光照或时间"],
- "style_tags": ["少量风格标签，可用 1.2::key_tag:: 强调关键元素"],
- "nsfw_level": "safe|suggestive|explicit"
+ "style_tags": ["少量风格标签"],
+ "nsfw_level": "safe|suggestive|explicit",
+ "weights": [
+   {"tag": "与上述某个标签完全一致的英文小写标签", "level": "weak|strong|very_strong"}
+ ]
 }
 
 规则：
@@ -67,12 +72,17 @@ JSON schema:
 - 不得添加用户未明确描述的服装、道具、天气、光照、时间或外观。
 - 不得输出 masterpiece、best_quality、画师标签、负面词、尺寸或比例词。
 - 不要堆叠同义词；每个概念只保留一个最准确标签。
-- 未提及的数组必须返回空数组。"""
+- 未提及的数组必须返回空数组。
+- 强调/弱化（weights）：仅当用户明确表达强调或弱化意图时填写。
+  - 突出/强调/重点 → strong；非常/极其/最/强烈 → very_strong；弱化/淡化/忽略/不要 → weak。
+  - tag 必须是上述数组中已存在的、完全一致的英文小写普通标签（不含权重语法）。
+  - 用户未表达强调意图时 weights 返回空数组。"""
 
 FORMAT_RETRY_PROMPT = """上一次输出不符合指定 JSON schema。
 请只返回完整、合法的 JSON 对象，不要 Markdown、解释或其它文字。
-必须包含 characters、shared_tags、outfit_tags、action_tags、scene_tags、style_tags、nsfw_level；
-characters 的每一项必须包含 display_name、danbooru_tag、tags。"""
+必须包含 characters、shared_tags、outfit_tags、action_tags、scene_tags、style_tags、nsfw_level、weights；
+characters 的每一项必须包含 display_name、danbooru_tag、tags；
+weights 的每一项必须包含 tag、level（level 取 weak/strong/very_strong）。"""
 
 CONFLICT_FILTER_SYSTEM_PROMPT = """你是标签去冲突器。用户明确指定了服装和/或动作标签，你需要从角色的关联标签中移除与用户指定标签语义冲突的标签。
 
@@ -108,8 +118,11 @@ JSON schema:
  "outfit_tags": ["服装标签"],
  "action_tags": ["动作和互动标签"],
  "scene_tags": ["场景、道具、光照或时间标签"],
- "style_tags": ["少量风格标签，可用 1.2::key_tag:: 强调关键元素"],
- "nsfw_level": "safe|suggestive|explicit"
+ "style_tags": ["风格标签"],
+ "nsfw_level": "safe|suggestive|explicit",
+ "weights": [
+   {"tag": "与上述某个标签完全一致的英文小写标签", "level": "weak|strong|very_strong"}
+ ]
 }
 
 规则：
@@ -118,7 +131,12 @@ JSON schema:
 - 丢弃画师名、masterpiece、best_quality 等通用质量标签。
 - nsfw_level 根据标签判定：含 naked/nipples/pussy 等为 explicit；含 underwear/ecchi 等为 suggestive；否则 safe。
 - 普通标签必须英文小写下划线；不要写完整句子。
-- 未提及的数组必须返回空数组。"""
+- 未提及的数组必须返回空数组。
+- 主动优化（weights）：识别图片主体与核心特征，自动给核心特征标签加权（核心服装/显著特征 → strong，次要背景/弱化元素 → weak），并补全反推不出的风格、构图、光照、景别缺失标签到 style_tags/scene_tags。
+  - 仅补全风格/构图/光照/景别，不脑补具体道具、服装、角色等事实性标签。
+  - 用户描述中有强调/弱化意图时，同样按 strong/very_strong/weak 填入 weights。
+  - tag 必须是上述数组中已存在的、完全一致的英文小写普通标签（不含权重语法）。
+  - 无需要时 weights 返回空数组。"""
 
 
 class NaiPromptPlugin(Star):
@@ -391,6 +409,8 @@ class NaiPromptPlugin(Star):
     ) -> tuple[ParsedRequest | None, str | None]:
         """图片反推完整流程：下载图片 → Tagger 反推 → LLM 整理。
 
+        整理阶段按 image_auto_optimize 配置决定是否自动优化（补全缺失标签 + 自动加权核心特征）。
+
         Args:
             event: 消息事件
             source: 图片来源（本地路径或 URL）
@@ -411,7 +431,12 @@ class NaiPromptPlugin(Star):
             suffix = f"（{reason}）" if reason else ""
             return None, f"图片识别失败{suffix}，请检查图片清晰度后重试。"
         prompt = f"标签: {', '.join(tags)}\n描述: {description or '（无）'}"
-        parsed = await self._parse_with_llm(event, prompt, system_prompt=TAGGER_ORGANIZE_SYSTEM_PROMPT)
+        system_prompt = TAGGER_ORGANIZE_SYSTEM_PROMPT
+        if not self._cfg_bool("image_auto_optimize", True):
+            # 关闭自动优化：仅忠实整理反推标签，不补全、不自动加权核心特征；
+            # 但用户描述中的强调/弱化意图仍按 weights 规则生效
+            system_prompt += "\n\n本次请勿补全缺失标签、勿自动加权核心特征，仅忠实整理反推标签；但用户描述中的强调/弱化意图仍按规则填写 weights。"
+        parsed = await self._parse_with_llm(event, prompt, system_prompt=system_prompt)
         if parsed is None:
             return None, "提示词整理失败，请稍后重试。"
         return parsed, None

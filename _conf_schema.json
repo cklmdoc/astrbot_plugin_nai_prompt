@@ -56,5 +56,10 @@
     "type": "int",
     "description": "允许反推的最大图片字节数（1-50MB），默认 10MB。",
     "default": 10485760
+  },
+  "image_auto_optimize": {
+    "type": "bool",
+    "description": "图片反推时是否自动优化：自动加权核心特征并补全风格/构图/光照/景别缺失标签；关闭时仅忠实整理反推标签（用户文字强调仍生效）。",
+    "default": true
   }
 }
