@@ -61,5 +61,21 @@
     "type": "bool",
     "description": "图片反推时是否自动优化：自动加权核心特征并补全风格/构图/光照/景别缺失标签；关闭时仅忠实整理反推标签（用户文字强调仍生效）。",
     "default": true
+  },
+  "enable_image_generation": {
+    "type": "bool",
+    "description": "是否在返回提示词后自动生成示例图；生图失败时静默降级为仅返回文本提示词。",
+    "default": false
+  },
+  "image_count": {
+    "type": "int",
+    "description": "开启示例图生成时每次生成的图片张数（1-4）。",
+    "default": 1
+  },
+  "image_api_url": {
+    "type": "string",
+    "description": "OpenAI Images API 兼容的生图服务基址（AstrBot 本地生图插件），末尾 / 会自动忽略。",
+    "hint": "默认 http://127.0.0.1:8765；API Key 与模型名由插件内置占位符填充，服务不校验。",
+    "default": "http://127.0.0.1:8765"
   }
 }

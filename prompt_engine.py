@@ -818,3 +818,126 @@ def format_result(result: PromptResult) -> str:
     if result.multi_character_note:
         meta.append("多角色:将各角色专属标签分别填入 Character Prompting")
     return f"{result.positive}\n（{' | '.join(meta)}）"
+
+
+# 生图服务默认值与占位符（本地 AstrBot 生图插件不校验 Key/模型名）
+IMAGE_GEN_API_DEFAULT = "http://127.0.0.1:8765"
+IMAGE_GEN_MODEL = "astrbot-image"
+IMAGE_GEN_API_KEY = "astrbot"
+IMAGE_GEN_SIZE = "1024x1024"
+
+
+class ImageGeneratorClient:
+    """OpenAI Images API 兼容的生图客户端，调用本地 AstrBot 生图插件生成示例图。
+
+    属性:
+        api_url: 生图服务基址（OpenAI Images API 兼容）
+        timeout_seconds: 单次生图请求超时秒数
+        _last_error: 最近一次失败原因
+    """
+
+    def __init__(self, api_url: str = IMAGE_GEN_API_DEFAULT, timeout_seconds: int = 180):
+        """初始化生图客户端。
+
+        Args:
+            api_url: 生图服务基址，末尾 / 会自动忽略
+            timeout_seconds: 请求超时秒数
+        """
+        self.api_url = (api_url or IMAGE_GEN_API_DEFAULT).rstrip("/")
+        self.timeout_seconds = max(30, min(600, int(timeout_seconds)))
+        self._last_error = ""
+
+    async def generate(self, prompt: str, count: int) -> list[bytes]:
+        """调用生图服务生成 count 张图片。
+
+        Args:
+            prompt: 生图用的正面提示词
+            count: 生成张数（夹取到 1-4）
+
+        Returns:
+            图片字节列表；失败返回空列表并在 self._last_error 记录原因
+        """
+        if not prompt:
+            return []
+        count = max(1, min(4, int(count)))
+        url = f"{self.api_url}/v1/images/generations"
+        payload = {
+            "model": IMAGE_GEN_MODEL,
+            "prompt": prompt,
+            "n": count,
+            "size": IMAGE_GEN_SIZE,
+            "response_format": "b64_json",
+        }
+        headers = {
+            "Authorization": f"Bearer {IMAGE_GEN_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        self._last_error = f"生图 HTTP {response.status}（{url}）"
+                        logger.error("[ImageGen] %s", self._last_error)
+                        return []
+                    body = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            self._last_error = f"生图请求异常: {type(exc).__name__}: {exc}（{url}）"
+            logger.error("[ImageGen] %s", self._last_error)
+            return []
+
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            self._last_error = f"生图响应缺少 data 列表: {str(body)[:200]}"
+            logger.error("[ImageGen] %s", self._last_error)
+            return []
+        images: list[bytes] = []
+        for item in data[:count]:
+            image_bytes = await self._extract_image(item)
+            if image_bytes:
+                images.append(image_bytes)
+        if not images:
+            self._last_error = "生图响应未包含有效图片"
+            logger.error("[ImageGen] %s，响应: %s", self._last_error, str(body)[:300])
+        return images
+
+    async def _extract_image(self, item: Any) -> bytes | None:
+        """从单个生图结果项中提取图片字节，优先 b64_json，其次 url 下载。
+
+        Args:
+            item: data 数组中的单项
+
+        Returns:
+            图片字节；失败返回 None
+        """
+        if not isinstance(item, dict):
+            return None
+        b64 = item.get("b64_json")
+        if isinstance(b64, str) and b64:
+            try:
+                return base64.b64decode(b64)
+            except (ValueError, TypeError):
+                return None
+        url = item.get("url")
+        if isinstance(url, str) and url:
+            return await self._download_image(url)
+        return None
+
+    async def _download_image(self, url: str) -> bytes | None:
+        """下载远程图片 URL 返回字节。
+
+        Args:
+            url: 图片 URL
+
+        Returns:
+            图片字节；失败返回 None
+        """
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return None
+                    return await response.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None

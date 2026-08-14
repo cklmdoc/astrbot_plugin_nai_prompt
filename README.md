@@ -36,6 +36,12 @@ DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若
 
 图片反推时默认开启主动优化（`image_auto_optimize`，默认 `true`）：自动给核心特征标签加权，并补全反推不出的风格/构图/光照/景别缺失标签；关闭后仅忠实整理反推标签。
 
+## 示例图生成
+
+开启 `enable_image_generation`（默认 `false`）后，插件会在返回提示词后调用本地生图服务生成示例图，并按 `image_count`（默认 1）回传指定张数。
+
+生图服务为[NAI生图插件](https://github.com/woakato/astrbot_plugin_nai_image)的 OpenAI Images API 兼容接口（默认 `http://127.0.0.1:8765`，即 AstrBot 本地生图插件），API Key 与模型名由插件内置占位符填充、服务不校验；生图失败时静默降级为仅返回文本提示词。
+
 输出为极简纯文本：正面提示词 + 一行元信息注释（来源 / NSFW / 角色 / 多角色建议）。默认不截断（`max_prompt_length` 设为 0），可按需配置上限。
 
 成人向仅在 `allow_adult_prompts=true` 且解析出 `explicit` 等级时启用；其它情况均生成全年龄版本。

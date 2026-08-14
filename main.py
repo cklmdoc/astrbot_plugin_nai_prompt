@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 import time
 
 import aiohttp
@@ -18,9 +19,11 @@ from astrbot.core import AstrBotConfig
 
 from .prompt_engine import (
     DANBOORU_SEARCH_API_DEFAULT,
+    IMAGE_GEN_API_DEFAULT,
     TAGGER_API_DEFAULT,
     CharacterTags,
     DanbooruSearchLookup,
+    ImageGeneratorClient,
     ImageTaggerClient,
     ParsedRequest,
     build_prompt,
@@ -145,6 +148,7 @@ class NaiPromptPlugin(Star):
         self.config = config or {}
         self.lookup: DanbooruSearchLookup | None = None
         self.tagger: ImageTaggerClient | None = None
+        self.generator: ImageGeneratorClient | None = None
         self._last_request: dict[str, float] = {}
 
     async def initialize(self) -> None:
@@ -157,12 +161,17 @@ class NaiPromptPlugin(Star):
             timeout_seconds=self._cfg_int("tagger_timeout_seconds", 30, 5, 60),
             confidence_threshold=self._cfg_float("tagger_confidence_threshold", 0.35, 0.0, 1.0),
         )
+        self.generator = ImageGeneratorClient(
+            api_url=self._cfg_str("image_api_url", IMAGE_GEN_API_DEFAULT),
+            timeout_seconds=180,
+        )
         logger.info("[NAIPrompt] 插件已加载")
 
     async def terminate(self) -> None:
         self._last_request.clear()
         self.lookup = None
         self.tagger = None
+        self.generator = None
         logger.info("[NAIPrompt] 插件已停止")
 
     def _cfg_str(self, key: str, default: str = "") -> str:
@@ -493,6 +502,44 @@ class NaiPromptPlugin(Star):
 
         return list(await asyncio.gather(*(filter_one(r) for r in lookup_results)))
 
+    @staticmethod
+    def _save_temp_image(image_bytes: bytes) -> str | None:
+        """将图片字节写入临时文件并返回路径。
+
+        Args:
+            image_bytes: 图片字节
+
+        Returns:
+            临时文件路径；失败返回 None
+        """
+        suffix = ".jpg" if image_bytes[:3] == b"\xff\xd8\xff" else ".png"
+        try:
+            fd, path = tempfile.mkstemp(prefix="nai_prompt_", suffix=suffix)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(image_bytes)
+            return path
+        except OSError:
+            return None
+
+    async def _generate_images(self, event: AstrMessageEvent, positive: str):
+        """按配置生成示例图并通过图片消息回传；失败静默降级。
+
+        Args:
+            event: 消息事件
+            positive: 正面提示词（生图 prompt）
+
+        Yields:
+            图片消息结果
+        """
+        if not positive or self.generator is None:
+            return
+        count = self._cfg_int("image_count", 1, 1, 4)
+        images = await self.generator.generate(positive, count)
+        for image_bytes in images:
+            path = self._save_temp_image(image_bytes)
+            if path:
+                yield event.image_result(path)
+
     @filter.command("提示词")
     async def prompt_command(self, event: AstrMessageEvent, description: str = ""):
         """/提示词 <自然语言描述>：生成可复制的 NAI 正负面提示词；附带图片时反推图片并整理提示词。"""
@@ -534,3 +581,7 @@ class NaiPromptPlugin(Star):
             provider=provider,
         )
         yield event.plain_result(format_result(result))
+        # 按配置生成示例图；生图失败静默降级，不影响已返回的文本提示词
+        if self._cfg_bool("enable_image_generation", False):
+            async for image_result in self._generate_images(event, result.positive):
+                yield image_result
