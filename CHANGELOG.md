@@ -2,7 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 与语义化版本规范。
 
-## \[v1.3.0] - 2026-08-14
+## [v1.4.0] - 2026-08-14
+
+### 新增
+- 切换到 NAI 新版格式：角色用 `人物名(作品名)` 引用（DanbooruSearch 组合 Character canonical + Copyright 作品名）。
+- 多角色 Character Prompting：`{人物 [tags], {位置} 人物}` 包裹 + `{人物 与 人物}` 连接，最多 6 人，位置由 LLM 判断。
+- 互动标签：`source#动作` / `target#动作` / `mutual#动作`。
+- 渲染文字（`Text:` / `no text`）与情绪词支持。
+
+### 变更
+- 权重语法改为新版 `权重::标签::`（weak→`0.8::tag::`、strong→`1.2::tag::`、very_strong→`1.5::tag::`）。
+- 单角色输出改为平铺 `人物名(作品名), 1girl, solo, 特征...`。
+- 移除旧版 `(tag:1.2)` / `[tag]` / `{tag}` 权重语法与多角色"请自行拆分"提示。
+
+## [v1.3.0] - 2026-08-14
 
 ### 新增
 

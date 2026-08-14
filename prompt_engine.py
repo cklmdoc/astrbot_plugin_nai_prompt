@@ -25,7 +25,7 @@ TAGGER_MODEL = "SmilingWolf/wd-swinv2-tagger-v3"
 TAGGER_CHARACTER_THRESHOLD = 0.85
 
 DEDUP_SYSTEM_PROMPT = """你是 NAI 标签去重器。只返回一个合法 JSON 对象，不要 Markdown、解释或额外文字。
-输入是一组英文小写 NAI/Danbooru 标签，可能含 NAI 权重语法（如 (tag:1.2) 强调或 [tag] 弱化）。
+输入是一组英文小写 NAI/Danbooru 标签，可能含 NAI 新版权重语法（如 1.2::tag::）或互动标签（如 source#hug）。
 
 JSON schema:
 {
@@ -53,6 +53,7 @@ class CharacterRequest:
     display_name: str = ""
     danbooru_tag: str = ""
     tags: list[str] = field(default_factory=list)
+    position: str = ""
 
 
 @dataclass
@@ -68,9 +69,10 @@ class WeightEntry:
     level: str = "strong"
 
 
-# 三档权重映射：weak 用方括号弱化，strong/very_strong 用 NAI 原生括号加权
+# 三档权重映射：新版 NAI 权重::标签:: 语法
+WEIGHT_WEAK_VALUE = 0.8
 WEIGHT_STRONG_VALUE = 1.2
-WEIGHT_VERY_STRONG_VALUE = 1.4
+WEIGHT_VERY_STRONG_VALUE = 1.5
 
 
 @dataclass
@@ -90,6 +92,7 @@ class CharacterTags:
     display_name: str
     canonical_tag: str
     tags: list[str]
+    copyright_tag: str = ""
 
 
 @dataclass
@@ -99,20 +102,24 @@ class PromptResult:
     character_tags: list[str]
     source: str
     nsfw_level: str
-    multi_character_note: bool = False
 
 
 def _as_tag_list(value: Any, limit: int = 80, allow_weights: bool = False) -> list[str]:
     if not isinstance(value, list):
         return []
     result: list[str] = []
-    # 权重语法为 NAI 原生：强调 (tag:1.2)，弱化 [tag]
-    tag_pattern = r"(?:[a-z0-9_()\-]+|\([a-z0-9_()\-]+:\d+(?:\.\d+)?\)|\[[a-z0-9_()\-]+\])"
+    # 标签支持互动前缀（source#/target#/mutual#）；权重语法为 NAI 新版 权重::标签::
+    tag_pattern = r"(?:[a-z0-9_()#\-]+|\d+(?:\.\d+)?::[a-z0-9_()#,\-]+::)"
     for item in value[:limit]:
         if not isinstance(item, str):
             continue
-        tag = item.strip().lower().replace(" ", "_")
-        if tag and re.fullmatch(tag_pattern if allow_weights else r"[a-z0-9_()\-]+", tag):
+        raw = item.strip()
+        # 渲染文字 Text: 内容 保留原样（NAI 特殊语法，可含大小写/标点/空格）
+        if raw.lower().startswith("text:"):
+            result.append(raw)
+            continue
+        tag = raw.lower().replace(" ", "_")
+        if tag and re.fullmatch(tag_pattern if allow_weights else r"[a-z0-9_()#\-]+", tag):
             result.append(tag)
     return result
 
@@ -177,10 +184,14 @@ def parse_llm_response(text: str) -> ParsedRequest | None:
         if not isinstance(item["display_name"], str) or not isinstance(item["danbooru_tag"], str) or not isinstance(item["tags"], list):
             return None
         canonical_hint = _as_tag_list([item["danbooru_tag"]], 1)
+        position = item.get("position", "")
+        if not isinstance(position, str):
+            position = ""
         characters.append(CharacterRequest(
             display_name=item["display_name"].strip()[:100],
             danbooru_tag=canonical_hint[0] if canonical_hint else "",
             tags=_as_tag_list(item["tags"], 40),
+            position=position.strip()[:20],
         ))
     return ParsedRequest(
         characters=characters,
@@ -201,22 +212,22 @@ def resolve_nsfw_level(parsed: ParsedRequest, allow_adult: bool) -> str:
 
 
 def render_weighted_tag(tag: str, level: str) -> str:
-    """将普通标签按等级渲染为 NAI 原生权重语法。
+    """将普通标签按等级渲染为 NAI 新版 权重::标签:: 语法。
 
     Args:
         tag: 英文小写普通标签
         level: 强调等级，weak/strong/very_strong
 
     Returns:
-        weak -> [tag]，strong -> (tag:1.2)，very_strong -> (tag:1.4)；
+        weak -> 0.8::tag::，strong -> 1.2::tag::，very_strong -> 1.5::tag::；
         其它等级原样返回
     """
     if level == "weak":
-        return f"[{tag}]"
+        return f"{WEIGHT_WEAK_VALUE}::{tag}::"
     if level == "very_strong":
-        return f"({tag}:{WEIGHT_VERY_STRONG_VALUE})"
+        return f"{WEIGHT_VERY_STRONG_VALUE}::{tag}::"
     if level == "strong":
-        return f"({tag}:{WEIGHT_STRONG_VALUE})"
+        return f"{WEIGHT_STRONG_VALUE}::{tag}::"
     return tag
 
 
@@ -241,6 +252,22 @@ def _apply_weights(tags: list[str], weights: list[WeightEntry]) -> list[str]:
         else:
             result.append(tag)
     return result
+
+
+def format_character_name(canonical_tag: str, copyright_tag: str) -> str:
+    """组合角色 canonical 标签与作品名为可读的 人物名(作品名) 形式。
+
+    Args:
+        canonical_tag: 角色 canonical 标签（下划线形式）
+        copyright_tag: 作品名标签（可为空）
+
+    Returns:
+        人物名(作品名) 可读形式；无作品名时仅人物名
+    """
+    name = canonical_tag.replace("_", " ")
+    if copyright_tag:
+        return f"{name} ({copyright_tag.replace('_', ' ')})"
+    return name
 
 
 def nsfw_tags(level: str) -> list[str]:
@@ -304,19 +331,20 @@ class DanbooruSearchLookup:
             "top_k": 5,
             "limit": 20,
             "show_nsfw": show_nsfw,
-            "target_categories": ["Character"],
+            "target_categories": ["Character", "Copyright"],
             "group_mode": "off",
         })
         if search_data is None:
             return None
-        candidates = [
-            item for item in search_data.get("results", [])
+        results = search_data.get("results", [])
+        character_candidates = [
+            item for item in results
             if isinstance(item, dict) and item.get("category") == "Character"
             and isinstance(item.get("tag"), str)
         ]
-        if not candidates:
+        if not character_candidates:
             return None
-        candidate = max(candidates, key=lambda item: float(item.get("final_score", 0) or 0))
+        candidate = max(character_candidates, key=lambda item: float(item.get("final_score", 0) or 0))
         try:
             score = float(candidate.get("final_score", 0))
         except (TypeError, ValueError):
@@ -324,6 +352,17 @@ class DanbooruSearchLookup:
         if score < CHARACTER_SCORE_THRESHOLD:
             return None
         canonical_tag = candidate["tag"]
+
+        # 作品名（Copyright）为可选项，取最高分；失败不影响角色识别
+        copyright_tag = ""
+        copyright_candidates = [
+            item for item in results
+            if isinstance(item, dict) and item.get("category") == "Copyright"
+            and isinstance(item.get("tag"), str)
+        ]
+        if copyright_candidates:
+            best_copyright = max(copyright_candidates, key=lambda item: float(item.get("final_score", 0) or 0))
+            copyright_tag = best_copyright["tag"]
 
         # Related tags are optional enhancement. A failure never drops canonical identity.
         related_data = await self._post("related", {
@@ -338,7 +377,7 @@ class DanbooruSearchLookup:
                 item.get("tag", "") for item in related_data.get("results", [])
                 if isinstance(item, dict) and item.get("category") == "General"
             ])
-        result = CharacterTags(request.display_name, canonical_tag, [canonical_tag] + related_tags)
+        result = CharacterTags(request.display_name, canonical_tag, related_tags, copyright_tag)
         self._cache[key] = (time.monotonic(), result)
         return result
 
@@ -760,46 +799,83 @@ def _truncate_tags(tags: list[str], max_length: int) -> list[str]:
 
 async def build_prompt(
     parsed: ParsedRequest,
-    lookup_results: list[CharacterTags],
+    lookup_results: list[CharacterTags | None],
     allow_adult: bool,
     max_length: int,
     provider: Any = None,
 ) -> PromptResult:
-    """组装最终正负面提示词。
+    """按 NAI 新版格式组装最终正面提示词。
 
-    标签顺序：人数/共享 → 角色 → 用户专属外观 → 服装 → 动作 → 场景 → 风格 → NSFW；
-    先去除完全重复并套用权重语法，再交由 LLM 做语义去重（失败降级不去重），
-    最后按 max_length 截断（0 不截断）。
+    单角色：人物名(作品名) 与特征、服装、动作、场景、风格等平铺；
+    多角色：每个角色用 {人物 [tags], {位置} 人物} 包裹，{人物 与 人物} 连接，
+    共享标签放在包裹之外。权重统一用 权重::标签:: 语法，语义去重失败降级不去重。
 
     Args:
         parsed: LLM 解析结果
-        lookup_results: DanbooruSearch 角色查询结果列表
+        lookup_results: DanbooruSearch 角色查询结果列表，与 parsed.characters 等长（未命中为 None）
         allow_adult: 是否允许成人向
-        max_length: 正面提示词最大字符数，0 表示不截断
+        max_length: 正面提示词最大字符数，0 表示不截断（仅单角色生效）
         provider: LLM provider，用于语义去重；None 时跳过语义去重
 
     Returns:
         组装后的 PromptResult
     """
     level = resolve_nsfw_level(parsed, allow_adult)
-    resolved_tags = _unique([tag for result in lookup_results for tag in result.tags])
-    user_character_tags = [tag for character in parsed.characters for tag in character.tags]
-    merged_tags = (
-        parsed.shared_tags + resolved_tags + user_character_tags + parsed.outfit_tags
-        + parsed.action_tags + parsed.scene_tags + parsed.style_tags + nsfw_tags(level)
+
+    # 构建每个角色的可读名与专属标签（含权重套用）
+    char_entries: list[tuple[str, list[str], str]] = []
+    char_names: list[str] = []
+    for index, char in enumerate(parsed.characters):
+        result = lookup_results[index] if index < len(lookup_results) else None
+        if result is not None:
+            name = format_character_name(result.canonical_tag, result.copyright_tag)
+            tags = _unique(result.tags + char.tags)
+        else:
+            name = char.display_name.strip()
+            tags = _unique(char.tags)
+        tags = _apply_weights(tags, parsed.weights)
+        char_entries.append((name, tags, char.position.strip()))
+        if name:
+            char_names.append(name)
+
+    # 共享标签（人数、服装、动作、场景、风格、NSFW）
+    shared_tags = _unique(
+        parsed.shared_tags + parsed.outfit_tags + parsed.action_tags
+        + parsed.scene_tags + parsed.style_tags + nsfw_tags(level)
     )
-    merged_tags = _unique(merged_tags)
-    weighted_tags = _apply_weights(merged_tags, parsed.weights)
-    all_tags = await _dedupe_tags_semantic(provider, weighted_tags)
-    selected = _truncate_tags(all_tags, max_length)
-    source = "DanbooruSearch 角色标签" if lookup_results else "LLM 转译"
+    shared_tags = _apply_weights(shared_tags, parsed.weights)
+
+    if len(char_entries) >= 2:
+        # 多角色：每个角色用 {人物 [...]} 包裹，{人物 与 人物} 连接，共享标签放外面
+        pieces: list[str] = []
+        for idx, (name, tags, position) in enumerate(char_entries):
+            if idx > 0:
+                pieces.append("{人物 与 人物}")
+            inner = ", ".join(([name] if name else []) + tags)
+            pos = f", {{位置{position}}}" if position else ""
+            pieces.append(f"{{人物 [{inner}]{pos} 人物}}")
+        shared = await _dedupe_tags_semantic(provider, shared_tags)
+        positive = ", ".join(pieces + shared)
+    else:
+        # 单角色或原创：平铺（角色名不参与去重/截断，始终在最前）
+        if char_entries:
+            name, tags, _ = char_entries[0]
+            body = tags + shared_tags
+            body = await _dedupe_tags_semantic(provider, body)
+            body = _truncate_tags(body, max_length)
+            positive = ", ".join(([name] if name else []) + body)
+        else:
+            body = await _dedupe_tags_semantic(provider, shared_tags)
+            body = _truncate_tags(body, max_length)
+            positive = ", ".join(body)
+
+    source = "DanbooruSearch 角色标签" if any(r is not None for r in lookup_results) else "LLM 转译"
     return PromptResult(
-        positive=", ".join(selected),
+        positive=positive,
         negative="",
-        character_tags=resolved_tags,
+        character_tags=char_names,
         source=source,
         nsfw_level={"safe": "全年龄", "suggestive": "擦边", "explicit": "成人向"}[level],
-        multi_character_note=len(parsed.characters) >= 2,
     )
 
 
@@ -810,13 +886,11 @@ def format_result(result: PromptResult) -> str:
         result: 组装结果
 
     Returns:
-        正面提示词纯文本，末尾附带来源、NSFW、角色标签与多角色建议的一行注释
+        正面提示词纯文本，末尾附带来源、NSFW、角色的一行注释
     """
     meta = [f"来源:{result.source}", f"NSFW:{result.nsfw_level}"]
     if result.character_tags:
         meta.append(f"角色:{', '.join(result.character_tags)}")
-    if result.multi_character_note:
-        meta.append("多角色:将各角色专属标签分别填入 Character Prompting")
     return f"{result.positive}\n（{' | '.join(meta)}）"
 
 

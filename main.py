@@ -46,15 +46,16 @@ MAX_DESCRIPTION_LENGTH = 500
 IMAGE_URL_PATTERN = re.compile(r"https?://[^\s]+?\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s]*)?", re.IGNORECASE)
 
 LLM_SYSTEM_PROMPT = """你是 NAI 标签提示词解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
-将用户自然语言转换为紧凑、英文小写 NAI/Danbooru 标签数据。
+将用户自然语言转换为紧凑、英文小写 NAI 新版格式标签数据。
 
 JSON schema:
 {
  "characters": [
    {
-     "display_name": "角色中文或常用名；原创角色填空字符串",
-     "danbooru_tag": "留空字符串；角色标签由插件查询服务确定",
-     "tags": ["该角色本次明确指定的专属外观标签"]
+     "display_name": "角色名（中文或英文常用名）；原创角色填空字符串",
+     "danbooru_tag": "留空字符串；角色标签与作品名由插件查询服务确定",
+     "tags": ["该角色专属标签，含外貌特征；多角色互动时含互动标签"],
+     "position": "多角色时该角色位置，如 左/中/右/上/下 及其组合；未提及填空字符串"
    }
  ],
  "shared_tags": ["人数和共享主体标签，如 1girl"],
@@ -69,12 +70,15 @@ JSON schema:
 }
 
 规则：
-- 角色仅在明确提及既有角色时填写 display_name；原创 OC 的 characters 可为空数组。
-- danbooru_tag 必须留空字符串，插件会使用 DanbooruSearch 查询 canonical 角色标签。
+- 角色仅在明确提及既有角色时填写 display_name（角色最终会以 人物名(作品名) 形式由插件自动组合）；原创 OC 的 characters 可为空数组。
+- danbooru_tag 必须留空字符串。
 - 普通标签必须英文小写下划线；不要写完整句子。
+- 互动标签：两个及以上角色有互动时，在对应角色 tags 写 source#动作（发起者）/ target#动作（承受者）/ mutual#动作（互相），如 source#hug。
+- 渲染文字：用户要求角色说话/画面文字时，在 scene_tags 或 style_tags 写 Text: 内容；不想要文字写 no text。
+- 情绪词：可加入少量情绪描述标签增强表现力。
 - 不得添加用户未明确描述的服装、道具、天气、光照、时间或外观。
 - 不得输出 masterpiece、best_quality、画师标签、负面词、尺寸或比例词。
-- 不要堆叠同义词；每个概念只保留一个最准确标签。
+- 不要堆叠同义词/重复/无意义标签；每个概念只保留一个最准确标签，描述清楚构图即可。
 - 未提及的数组必须返回空数组。
 - 强调/弱化（weights）：仅当用户明确表达强调或弱化意图时填写。
   - 突出/强调/重点 → strong；非常/极其/最/强烈 → very_strong；弱化/淡化/忽略/不要 → weak。
@@ -84,7 +88,7 @@ JSON schema:
 FORMAT_RETRY_PROMPT = """上一次输出不符合指定 JSON schema。
 请只返回完整、合法的 JSON 对象，不要 Markdown、解释或其它文字。
 必须包含 characters、shared_tags、outfit_tags、action_tags、scene_tags、style_tags、nsfw_level、weights；
-characters 的每一项必须包含 display_name、danbooru_tag、tags；
+characters 的每一项必须包含 display_name、danbooru_tag、tags、position；
 weights 的每一项必须包含 tag、level（level 取 weak/strong/very_strong）。"""
 
 CONFLICT_FILTER_SYSTEM_PROMPT = """你是标签去冲突器。用户明确指定了服装和/或动作标签，你需要从角色的关联标签中移除与用户指定标签语义冲突的标签。
@@ -113,8 +117,9 @@ JSON schema:
  "characters": [
    {
      "display_name": "识别出的角色名（如 hatsune_miku）；未识别到角色填空字符串",
-     "danbooru_tag": "留空字符串；角色标签由插件查询服务确定",
-     "tags": []
+     "danbooru_tag": "留空字符串；角色标签与作品名由插件查询服务确定",
+     "tags": ["该角色专属标签，含外貌特征；多角色互动时含互动标签"],
+     "position": "多角色时该角色位置，如 左/中/右/上/下 及其组合；未提及填空字符串"
    }
  ],
  "shared_tags": ["人数和共享主体标签，如 1girl"],
@@ -129,10 +134,13 @@ JSON schema:
 }
 
 规则：
-- 以反推标签为事实来源，将标签按语义归类到上述数组；识别出的角色名标签填入 characters 的 display_name。
+- 以反推标签为事实来源，将标签按语义归类到上述数组；识别出的角色名标签填入 characters 的 display_name（角色最终会以 人物名(作品名) 形式由插件自动组合）。
 - 用户描述与标签冲突时以用户描述为准（如“去掉校服”“换白色头发”）。
 - 丢弃画师名、masterpiece、best_quality 等通用质量标签。
 - nsfw_level 根据标签判定：含 naked/nipples/pussy 等为 explicit；含 underwear/ecchi 等为 suggestive；否则 safe。
+- 互动标签：多角色有互动时，在对应角色 tags 写 source#动作（发起者）/ target#动作（承受者）/ mutual#动作（互相）。
+- 渲染文字：画面/用户要求文字时，在 scene_tags 或 style_tags 写 Text: 内容；不想要文字写 no text。
+- 情绪词：可加入少量情绪描述标签增强表现力。
 - 普通标签必须英文小写下划线；不要写完整句子。
 - 未提及的数组必须返回空数组。
 - 主动优化（weights）：识别图片主体与核心特征，自动给核心特征标签加权（核心服装/显著特征 → strong，次要背景/弱化元素 → weak），并补全反推不出的风格、构图、光照、景别缺失标签到 style_tags/scene_tags。
@@ -451,26 +459,35 @@ class NaiPromptPlugin(Star):
         return parsed, None
 
     async def _lookup_characters(self, parsed: ParsedRequest):
+        """查询每个角色的 DanbooruSearch 结果。
+
+        Args:
+            parsed: LLM 解析结果
+
+        Returns:
+            与 parsed.characters 等长的结果列表，未命中项为 None
+        """
         if self.lookup is None:
-            return []
+            return [None] * len(parsed.characters)
         final_level = resolve_nsfw_level(parsed, self._cfg_bool("allow_adult_prompts", True))
         show_nsfw = final_level == "explicit"
-        results = await asyncio.gather(*(self.lookup.lookup(item, show_nsfw) for item in parsed.characters[:20]))
-        return [result for result in results if result is not None]
+        return await asyncio.gather(*(self.lookup.lookup(item, show_nsfw) for item in parsed.characters[:20]))
 
-    async def _filter_conflicting_tags(self, event: AstrMessageEvent, parsed: ParsedRequest, lookup_results: list[CharacterTags]) -> list[CharacterTags]:
+    async def _filter_conflicting_tags(
+        self, event: AstrMessageEvent, parsed: ParsedRequest, lookup_results: list[CharacterTags | None]
+    ) -> list[CharacterTags | None]:
         """通过 LLM 过滤角色关联标签中与用户指定服装/动作冲突的默认标签。
 
         仅当用户明确指定了 outfit_tags 或 action_tags 时触发。
-        按角色分别调用 LLM，并行执行；失败时降级为仅保留 canonical tag。
+        按角色分别调用 LLM，并行执行；失败时降级为清空关联标签（仅保留 canonical）。
 
         Args:
             event: 消息事件
             parsed: LLM 解析结果，包含 outfit_tags 和 action_tags
-            lookup_results: DanbooruSearch 查询结果列表
+            lookup_results: DanbooruSearch 查询结果列表，与 parsed.characters 等长（未命中为 None）
 
         Returns:
-            过滤后的 CharacterTags 列表
+            过滤后的结果列表（未命中项保持 None）
         """
         if not parsed.outfit_tags and not parsed.action_tags:
             return lookup_results
@@ -478,9 +495,14 @@ class NaiPromptPlugin(Star):
         provider = self.context.get_using_provider(umo=event.unified_msg_origin)
         if not provider:
             logger.warning("[NAIPrompt] 无可用 LLM provider，标签冲突过滤降级")
-            return [CharacterTags(r.display_name, r.canonical_tag, [r.canonical_tag]) for r in lookup_results]
+            return [
+                CharacterTags(r.display_name, r.canonical_tag, [], r.copyright_tag) if r is not None else None
+                for r in lookup_results
+            ]
 
-        async def filter_one(result: CharacterTags) -> CharacterTags:
+        async def filter_one(result: CharacterTags | None) -> CharacterTags | None:
+            if result is None:
+                return None
             prompt = json.dumps({
                 "outfit_tags": parsed.outfit_tags,
                 "action_tags": parsed.action_tags,
@@ -494,11 +516,11 @@ class NaiPromptPlugin(Star):
                     filtered = [str(t) for t in data["filtered_tags"] if isinstance(t, str)]
                     if filtered:
                         logger.info("[NAIPrompt] 角色 %s 标签冲突过滤完成: %d -> %d", result.display_name, len(result.tags), len(filtered))
-                        return CharacterTags(result.display_name, result.canonical_tag, filtered)
+                        return CharacterTags(result.display_name, result.canonical_tag, filtered, result.copyright_tag)
             except Exception as exc:
                 logger.warning("[NAIPrompt] 角色 %s 标签冲突过滤异常: %s", result.display_name, exc)
-            # 降级：只保留 canonical tag
-            return CharacterTags(result.display_name, result.canonical_tag, [result.canonical_tag])
+            # 降级：清空关联标签，仅保留 canonical
+            return CharacterTags(result.display_name, result.canonical_tag, [], result.copyright_tag)
 
         return list(await asyncio.gather(*(filter_one(r) for r in lookup_results)))
 

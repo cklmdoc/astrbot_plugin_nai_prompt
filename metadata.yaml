@@ -1,8 +1,8 @@
 name: astrbot_plugin_nai_prompt
 display_name: NAI 提示词助手
-version: v1.3.0
+version: v1.4.0
 author: cklmdoc
-desc: 将自然语言或图片转换为可复制的 NAI 生图提示词，支持图片反推、角色标签查询、权重强调控制、图片主动优化、示例图生成、语义去重、权限白名单和安全降级。
+desc: 将自然语言或图片转换为可复制的 NAI 新版格式提示词，支持角色作品名引用、多角色 Character Prompting、互动标签、权重强调、图片主动优化、示例图生成、语义去重、权限白名单和安全降级。
 repo: "https://github.com/cklmdoc/astrbot_plugin_nai_prompt"
 astrbot_version: ">=4.16"
 support_platforms:
