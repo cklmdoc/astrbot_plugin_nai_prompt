@@ -15,6 +15,12 @@
     "description": "同一用户两次生成之间的冷却秒数；设为 0 关闭。",
     "default": 5
   },
+  "allowed_image_hosts": {
+    "type": "list",
+    "description": "图片下载 SSRF 白名单：允许下载的图片主机（精确主机名 / IP / CIDR，如 media.local、192.168.1.10、10.0.0.0/8）。默认拦截私网、回环、链路本地与保留地址；自建媒体代理或内网图床需在此放行。",
+    "items": {"type": "string"},
+    "default": []
+  },
   "danbooru_search_api_url": {
     "type": "string",
     "description": "DanbooruSearch API 基址，可填兼容的自建实例或镜像。",

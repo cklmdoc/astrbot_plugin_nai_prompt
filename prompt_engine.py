@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import re
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
@@ -23,6 +26,11 @@ TAGGER_API_DEFAULT = "https://smilingwolf-wd-tagger.hf.space"
 TAGGER_MODEL = "SmilingWolf/wd-swinv2-tagger-v3"
 # 角色标签阈值默认值，贴合官方 Space UI 默认（general 0.35 / character 0.85）
 TAGGER_CHARACTER_THRESHOLD = 0.85
+
+# 单次请求最多支持的角色数（与文档"最多 6 人"一致）
+MAX_CHARACTERS = 6
+# 图片下载重定向跳数上限（每跳执行 SSRF 校验）
+MAX_REDIRECTS = 5
 
 DEDUP_SYSTEM_PROMPT = """你是 NAI 标签去重器。只返回一个合法 JSON 对象，不要 Markdown、解释或额外文字。
 输入是一组英文小写 NAI/Danbooru 标签，可能含 NAI 新版权重语法（如 1.2::tag::）或互动标签（如 source#hug）。
@@ -168,6 +176,21 @@ def _parse_weights(value: Any) -> list[WeightEntry]:
     return result
 
 
+def _safe_score(item: dict[str, Any]) -> float:
+    """安全提取 DanbooruSearch 候选的 final_score；缺失/非数字按 0.0 处理。
+
+    Args:
+        item: 候选结果项
+
+    Returns:
+        浮点分数；非法值返回 0.0
+    """
+    try:
+        return float(item.get("final_score", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def parse_llm_response(text: str) -> ParsedRequest | None:
     data = extract_json(text)
     if data is None:
@@ -178,7 +201,7 @@ def parse_llm_response(text: str) -> ParsedRequest | None:
     if data.get("nsfw_level") not in {"safe", "suggestive", "explicit"}:
         return None
     characters: list[CharacterRequest] = []
-    for item in data["characters"][:20]:
+    for item in data["characters"][:MAX_CHARACTERS]:
         if not isinstance(item, dict) or not {"display_name", "danbooru_tag", "tags"}.issubset(item):
             return None
         if not isinstance(item["display_name"], str) or not isinstance(item["danbooru_tag"], str) or not isinstance(item["tags"], list):
@@ -376,6 +399,106 @@ def clean_related_tags(tags: list[str]) -> list[str]:
     return cleaned
 
 
+def is_safe_url(
+    url: str,
+    allowed_hosts: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+) -> bool:
+    """判断 URL 是否可安全请求（SSRF 防护）。
+
+    仅接受 http/https；主机名命中白名单（精确主机名 / IP / CIDR）直接放行；
+    否则解析主机 IP，任一解析结果命中私网/回环/链路本地/保留地址即拒绝。
+
+    注意：校验阶段的 DNS 解析与 aiohttp 连接阶段的解析相互独立，存在 DNS
+    rebinding 理论窗口（TOCTOU）；对聊天机器人入口而言该攻击成本远高于收益，
+    此处接受该窗口（详见 Q6 设计决策）。
+
+    Args:
+        url: 待校验 URL
+        allowed_hosts: 管理员白名单集合（精确主机名 / IP / CIDR），命中即放行
+
+    Returns:
+        允许请求返回 True，否则 False
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    allowed = {str(h).strip().lower() for h in (allowed_hosts or ()) if str(h).strip()}
+    if host in allowed:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    ips = {info[4][0] for info in infos}
+    if not ips:
+        return False
+    for ip_str in ips:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if str(ip) in allowed or ip_str in allowed:
+            continue
+        cidr_hit = False
+        for entry in allowed:
+            if "/" in entry:
+                try:
+                    if ip in ipaddress.ip_network(entry, strict=False):
+                        cidr_hit = True
+                        break
+                except ValueError:
+                    continue
+        if cidr_hit:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False
+    return True
+
+
+async def fetch_url_bytes(
+    session: aiohttp.ClientSession,
+    url: str,
+    allowed_hosts: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+    max_redirects: int = MAX_REDIRECTS,
+    headers: dict[str, str] | None = None,
+) -> tuple[int | None, bytes | None]:
+    """按 SSRF 策略逐跳校验地下载 URL 内容。
+
+    每跳先调用 is_safe_url 校验；任一跳被拦截或重定向超限返回 (None, None)。
+    正常返回 (HTTP 状态码, 响应体)；调用方负责超时配置与异常处理。
+
+    Args:
+        session: aiohttp 会话
+        url: 起始 URL
+        allowed_hosts: SSRF 白名单（见 is_safe_url）
+        max_redirects: 最大跟随跳数
+        headers: 附加请求头
+
+    Returns:
+        (status, body)；被安全策略拦截或重定向超限时 (None, None)
+    """
+    current = url
+    for _ in range(max_redirects + 1):
+        if not is_safe_url(current, allowed_hosts):
+            return None, None
+        async with session.get(current, allow_redirects=False, headers=headers) as response:
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    return response.status, b""
+                current = urljoin(current, location)
+                continue
+            body = await response.read()
+            return response.status, body
+    return None, None
+
+
 class DanbooruSearchLookup:
     """Public DanbooruSearch API client with successful-result-only 24-hour cache."""
 
@@ -384,11 +507,11 @@ class DanbooruSearchLookup:
     def __init__(self, api_url: str = DANBOORU_SEARCH_API_DEFAULT, timeout_seconds: int = 5):
         self.api_url = (api_url or DANBOORU_SEARCH_API_DEFAULT).rstrip("/")
         self.timeout_seconds = max(2, min(15, int(timeout_seconds)))
-        self._cache: dict[str, tuple[float, CharacterTags]] = {}
+        self._cache: dict[tuple[str, bool], tuple[float, CharacterTags]] = {}
 
     @staticmethod
-    def _key(value: str) -> str:
-        return value.strip().lower()
+    def _key(value: str, show_nsfw: bool) -> tuple[str, bool]:
+        return value.strip().lower(), bool(show_nsfw)
 
     async def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
@@ -404,8 +527,8 @@ class DanbooruSearchLookup:
             return None
 
     async def lookup(self, request: CharacterRequest, show_nsfw: bool) -> CharacterTags | None:
-        key = self._key(request.display_name)
-        if not key:
+        key = self._key(request.display_name, show_nsfw)
+        if not key[0]:
             return None
         cached = self._cache.get(key)
         if cached and time.monotonic() - cached[0] < self.CACHE_TTL:
@@ -429,7 +552,7 @@ class DanbooruSearchLookup:
         ]
         if not character_candidates:
             return None
-        candidate = max(character_candidates, key=lambda item: float(item.get("final_score", 0) or 0))
+        candidate = max(character_candidates, key=_safe_score)
         try:
             score = float(candidate.get("final_score", 0))
         except (TypeError, ValueError):
@@ -446,7 +569,7 @@ class DanbooruSearchLookup:
             and isinstance(item.get("tag"), str)
         ]
         if copyright_candidates:
-            best_copyright = max(copyright_candidates, key=lambda item: float(item.get("final_score", 0) or 0))
+            best_copyright = max(copyright_candidates, key=_safe_score)
             copyright_tag = best_copyright["tag"]
 
         # Related tags are optional enhancement. A failure never drops canonical identity.
@@ -1001,15 +1124,27 @@ class ImageGeneratorClient:
         _last_error: 最近一次失败原因
     """
 
-    def __init__(self, api_url: str = IMAGE_GEN_API_DEFAULT, timeout_seconds: int = 180):
+    def __init__(
+        self,
+        api_url: str = IMAGE_GEN_API_DEFAULT,
+        timeout_seconds: int = 180,
+        allowed_hosts: frozenset[str] | set[str] | tuple[str, ...] = (),
+    ):
         """初始化生图客户端。
 
         Args:
             api_url: 生图服务基址，末尾 / 会自动忽略
             timeout_seconds: 请求超时秒数
+            allowed_hosts: 下载生图结果 URL 时的 SSRF 白名单；默认附加 api_url 自身主机
         """
         self.api_url = (api_url or IMAGE_GEN_API_DEFAULT).rstrip("/")
         self.timeout_seconds = max(30, min(600, int(timeout_seconds)))
+        # 生图服务返回的图片 URL 通常与其自身同主机，默认放行自身主机，避免破坏本地部署
+        try:
+            api_host = urlparse(self.api_url).hostname
+        except ValueError:
+            api_host = None
+        self.allowed_hosts = frozenset(allowed_hosts or ()) | ({api_host} if api_host else set())
         self._last_error = ""
 
     async def generate(self, prompt: str, count: int) -> list[bytes]:
@@ -1089,20 +1224,20 @@ class ImageGeneratorClient:
         return None
 
     async def _download_image(self, url: str) -> bytes | None:
-        """下载远程图片 URL 返回字节。
+        """下载远程图片 URL 返回字节（逐跳 SSRF 校验）。
 
         Args:
             url: 图片 URL
 
         Returns:
-            图片字节；失败返回 None
+            图片字节；失败或被安全策略拦截返回 None
         """
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        return None
-                    return await response.read()
+                status, body = await fetch_url_bytes(session, url, allowed_hosts=self.allowed_hosts)
+                if status is None or status != 200:
+                    return None
+                return body
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return None

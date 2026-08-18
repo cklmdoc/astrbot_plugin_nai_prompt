@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+from collections import deque
 
 import aiohttp
 
@@ -28,6 +29,7 @@ from .prompt_engine import (
     ParsedRequest,
     build_prompt,
     extract_json,
+    fetch_url_bytes,
     format_result,
     looks_like_prompt,
     parse_llm_response,
@@ -45,6 +47,11 @@ HELP_TEXT = """用法：/提示词 <自然语言描述>
 /提示词 + 图片 → 反推图片中的角色与特征"""
 MAX_DESCRIPTION_LENGTH = 500
 IMAGE_URL_PATTERN = re.compile(r"https?://[^\s]+?\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s]*)?", re.IGNORECASE)
+
+
+def _normalize_prompt_text(text: str) -> str:
+    """折叠空白用于引用溯源匹配；不改变提示词语义。"""
+    return " ".join(str(text).split())
 
 LLM_SYSTEM_PROMPT = """你是 NAI 标签提示词解析器。只输出一个合法 JSON 对象，不要 Markdown、解释或额外文字。
 将用户自然语言转换为紧凑、英文小写 NAI 新版格式标签数据。
@@ -172,6 +179,10 @@ class NaiPromptPlugin(Star):
         self.tagger: ImageTaggerClient | None = None
         self.generator: ImageGeneratorClient | None = None
         self._last_request: dict[str, float] = {}
+        # 查询/冲突过滤并发的共享信号量，避免多角色请求打爆外部服务
+        self._lookup_sem = asyncio.Semaphore(4)
+        # 最近输出的提示词缓冲（时间戳, 会话标识, 文本），供 self_id 缺失时引用溯源
+        self._recent_prompts: deque[tuple[float, str, str]] = deque(maxlen=50)
 
     async def initialize(self) -> None:
         self.lookup = DanbooruSearchLookup(
@@ -186,11 +197,13 @@ class NaiPromptPlugin(Star):
         self.generator = ImageGeneratorClient(
             api_url=self._cfg_str("image_api_url", IMAGE_GEN_API_DEFAULT),
             timeout_seconds=180,
+            allowed_hosts=tuple(self._cfg_list("allowed_image_hosts")),
         )
         logger.info("[NAIPrompt] 插件已加载")
 
     async def terminate(self) -> None:
         self._last_request.clear()
+        self._recent_prompts.clear()
         self.lookup = None
         self.tagger = None
         self.generator = None
@@ -199,6 +212,15 @@ class NaiPromptPlugin(Star):
     def _cfg_str(self, key: str, default: str = "") -> str:
         value = self.config.get(key, default) if hasattr(self.config, "get") else default
         return str(value).strip() if value is not None else default
+
+    def _cfg_list(self, key: str, default: list | None = None) -> list[str]:
+        """读取列表配置项；兼容字符串单值形态，去除空项与首尾空白。"""
+        value = self.config.get(key, default) if hasattr(self.config, "get") else default
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
         value = self.config.get(key, default) if hasattr(self.config, "get") else default
@@ -423,17 +445,21 @@ class NaiPromptPlugin(Star):
             except OSError:
                 return None, "图片读取失败，请重试。"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("tagger_timeout_seconds", 30, 5, 60))
+        allowed_hosts = frozenset(self._cfg_list("allowed_image_hosts"))
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(source) as response:
-                    if response.status != 200:
-                        return None, "图片下载失败，请检查链接是否有效。"
-                    body = await response.read()
-                    if len(body) > max_bytes:
-                        return None, "图片过大，请压缩后重试。"
-                    return body, None
+                status, body = await fetch_url_bytes(session, source, allowed_hosts=allowed_hosts)
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return None, "图片下载失败，请稍后重试。"
+        if status is None:
+            # 安全策略拦截（SSRF 防护）；不向用户泄露拦截细节，仅服务端留痕
+            logger.warning("[NAIPrompt] 图片 URL 被安全策略拦截: %s", source)
+            return None, "图片链接被拒绝，请更换图片源。"
+        if status != 200:
+            return None, "图片下载失败，请检查链接是否有效。"
+        if len(body) > max_bytes:
+            return None, "图片过大，请压缩后重试。"
+        return body, None
 
     async def _parse_image_flow(
         self, event: AstrMessageEvent, source: str, description: str
@@ -485,7 +511,13 @@ class NaiPromptPlugin(Star):
             return [None] * len(parsed.characters)
         final_level = resolve_nsfw_level(parsed, self._cfg_bool("allow_adult_prompts", True))
         show_nsfw = final_level == "explicit"
-        return await asyncio.gather(*(self.lookup.lookup(item, show_nsfw) for item in parsed.characters[:20]))
+
+        async def limited(item) -> CharacterTags | None:
+            async with self._lookup_sem:
+                return await self.lookup.lookup(item, show_nsfw)
+
+        results = await asyncio.gather(*(limited(item) for item in parsed.characters), return_exceptions=True)
+        return [r if isinstance(r, CharacterTags) else None for r in results]
 
     async def _filter_conflicting_tags(
         self, event: AstrMessageEvent, parsed: ParsedRequest, lookup_results: list[CharacterTags | None]
@@ -523,7 +555,8 @@ class NaiPromptPlugin(Star):
                 "character_tags": result.tags,
             }, ensure_ascii=False)
             try:
-                response = await provider.text_chat(prompt=prompt, contexts=[], system_prompt=CONFLICT_FILTER_SYSTEM_PROMPT)
+                async with self._lookup_sem:
+                    response = await provider.text_chat(prompt=prompt, contexts=[], system_prompt=CONFLICT_FILTER_SYSTEM_PROMPT)
                 text = getattr(response, "completion_text", "") if response else ""
                 data = extract_json(text)
                 if data and isinstance(data.get("filtered_tags"), list):
@@ -536,7 +569,8 @@ class NaiPromptPlugin(Star):
             # 降级：清空关联标签，仅保留 canonical
             return CharacterTags(result.display_name, result.canonical_tag, [], result.copyright_tag)
 
-        return list(await asyncio.gather(*(filter_one(r) for r in lookup_results)))
+        results = await asyncio.gather(*(filter_one(r) for r in lookup_results), return_exceptions=True)
+        return [r if isinstance(r, CharacterTags) else None for r in results]
 
     @staticmethod
     def _save_temp_image(image_bytes: bytes) -> str | None:
@@ -576,8 +610,44 @@ class NaiPromptPlugin(Star):
             if path:
                 yield event.image_result(path)
 
+    def _remember_prompt(self, text: str, event: AstrMessageEvent) -> None:
+        """记录最近输出的提示词，供引用溯源匹配使用。"""
+        if not text:
+            return
+        session_id = str(getattr(event, "unified_msg_origin", "") or "")
+        self._recent_prompts.append((time.monotonic(), session_id, text))
+
+    def _match_recent_prompt(self, text: str, session_id: str) -> bool:
+        """在最近输出缓冲区中查找与 text 双向包含匹配的记录。
+
+        Args:
+            text: 被引用的提示词文本
+            session_id: 当前会话标识（可能为空）
+
+        Returns:
+            命中返回 True，否则 False
+        """
+        now = time.monotonic()
+        normalized = _normalize_prompt_text(text)
+        if len(normalized) < 20:
+            return False
+        matched_ts: float | None = None
+        for ts, record_session, stored in self._recent_prompts:
+            if now - ts > 600:
+                continue
+            if record_session and session_id and record_session != session_id:
+                continue
+            stored_normalized = _normalize_prompt_text(stored)
+            if normalized in stored_normalized or stored_normalized in normalized:
+                if matched_ts is None or ts > matched_ts:
+                    matched_ts = ts
+        return matched_ts is not None
+
     async def _reply_prompt_source(self, event: AstrMessageEvent) -> str | None:
-        """从消息链中提取被引用回复的提示词文本（仅当引用的是机器人自己的提示词）。
+        """从消息链中提取被引用回复的提示词文本。
+
+        优先以"被引用消息发送者是机器人自己"（self_id 可用时）为准；
+        self_id 缺失时回退为内容溯源匹配（命中最近输出缓冲区）。
 
         Args:
             event: 消息事件
@@ -589,16 +659,24 @@ class NaiPromptPlugin(Star):
             self_id = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
         except Exception:
             self_id = ""
+        session_id = str(getattr(event, "unified_msg_origin", "") or "")
         for component in self._message_components(event):
             if component.__class__.__name__.lower() != "reply":
                 continue
             sender_id = str(getattr(component, "sender_id", "") or "")
-            message_str = getattr(component, "message_str", "") or getattr(component, "text", "") or ""
-            if self_id and sender_id and sender_id != self_id:
-                continue
+            message_str = str(getattr(component, "message_str", "") or getattr(component, "text", "") or "")
             if not message_str or not looks_like_prompt(str(message_str)):
                 continue
-            return str(message_str)
+            # 被引用消息的会话标识（部分适配器提供），不一致时拒绝跨会话引用
+            quoted_session = str(
+                getattr(component, "group_id", "") or getattr(component, "session_id", "") or ""
+            )
+            if self_id and sender_id and sender_id == self_id:
+                if quoted_session and session_id and quoted_session != session_id:
+                    continue
+                return str(message_str)
+            if not self_id and self._match_recent_prompt(str(message_str), session_id):
+                return str(message_str)
         return None
 
     async def _edit_prompt(self, event: AstrMessageEvent, quoted_prompt: str, instruction: str):
@@ -630,6 +708,7 @@ class NaiPromptPlugin(Star):
         if not text:
             yield event.plain_result("增量修改失败，请稍后重试。")
             return
+        self._remember_prompt(text, event)
         yield event.plain_result(text)
         if self._cfg_bool("enable_image_generation", False):
             async for image_result in self._generate_images(event, text):
@@ -691,7 +770,9 @@ class NaiPromptPlugin(Star):
             max_length=self._cfg_int("max_prompt_length", 0, 0, 5000),
             provider=provider,
         )
-        yield event.plain_result(format_result(result))
+        text_result = format_result(result)
+        yield event.plain_result(text_result)
+        self._remember_prompt(text_result, event)
         # 按配置生成示例图；生图失败静默降级，不影响已返回的文本提示词
         if self._cfg_bool("enable_image_generation", False):
             async for image_result in self._generate_images(event, result.positive):

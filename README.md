@@ -8,6 +8,12 @@ AstrBot 插件：将 `/提示词 <自然语言描述>` 转成可复制的 NAI �
 
 默认所有用户均可使用。如需限制，将 `enable_whitelist` 设为 `true` 并在 `allowed_user_ids` 填写允许的用户 ID；开启后仅管理员及白名单内用户可用。
 
+### 安全
+
+- **图片下载 SSRF 防护**：插件仅允许下载 http/https 图片，默认拦截私网、回环、链路本地与保留地址，并逐跳校验重定向（上限 5 跳）。若需从自建媒体代理或内网图床拉图，在 `allowed_image_hosts` 填写白名单（精确主机名 / IP / CIDR，如 `media.local`、`192.168.1.10`、`10.0.0.0/8`）。被拦截时返回"图片链接被拒绝，请更换图片源。"，管理员可在服务端日志查看被拦 URL。
+- 多角色请求（角色查询与标签冲突过滤）并发受信号量限制，单次请求最多支持 6 个角色。
+- 引用增量修改仅接受机器人自己发送的提示词（发送者校验；平台不提供时回退最近输出内容匹配，且拒绝跨会话引用）。
+
 ## 使用
 
 ```text
@@ -63,3 +69,12 @@ DanbooruSearch 默认 API：`https://sakizuki-danboorusearch.hf.space/api`。若
 输出为极简纯文本：正面提示词 + 一行元信息注释（来源 / NSFW / 角色）。默认不截断（`max_prompt_length` 设为 0），可按需配置上限。
 
 成人向仅在 `allow_adult_prompts=true` 且解析出 `explicit` 等级时启用；其它情况均生成全年龄版本。
+
+## 开发与测试
+
+仓库含单元测试（`tests/`，pytest，覆盖 SSRF 校验、分数防护、缓存键与角色上限，无网络依赖）。安装开发依赖并运行：
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -q
+```
